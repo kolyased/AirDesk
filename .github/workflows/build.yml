@@ -1,0 +1,16 @@
+name: Windows build
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet run --project tests -c Release
+      - run: dotnet publish src/AirDesk -c Release -r win-x64 --self-contained true -o dist/AirDesk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AirDesk-windows-x64
+          path: dist/AirDesk
