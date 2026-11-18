@@ -7,7 +7,6 @@ namespace AirDesk;
 
 public sealed partial class Dashboard
 {
-    string driverStatus = "Драйвер: проверка…";
     readonly ListBox cardOrder = new() { Margin = new(0, 2, 0, 8) };
     readonly TextBlock startupStatus = Text("", 12);
     bool rebuildingCards, readingStartup;
@@ -86,15 +85,10 @@ public sealed partial class Dashboard
         AddWrapped(systemTray, "Подсказка Windows вмещает только часть значений. Остальные доступны по щелчку по значку.");
         body.Children.Add(Surface(systemTray, new Thickness(14), new Thickness(0, 0, 0, 12)));
         body.Children.Add(BuildHistorySettings());
+        body.Children.Add(BuildUpdates());
         if (preferences.RecoveryNotice is { } notice) AddWrapped(body, notice);
         body.Children.Add(Button("Сбросить настройки…", () => _ = ResetPreferences()));
 
-        try
-        {
-            driverStatus = WindowsCooling.DriverVersion() is { } version ? $"Драйвер PawnIO {version} найден. Доступ к управлению указан в статусе охлаждения."
-                : "Драйвер PawnIO не обнаружен или его файл недоступен. AirDesk покажет доступные датчики.";
-        }
-        catch (Exception error) { Monitor.Log(error); driverStatus = "Не удалось определить версию драйвера. Проверьте диагностику."; }
         body.Children.Add(Button("Показать подсказку первого запуска", () =>
         {
             preferences.WelcomeDismissed = false; SavePreference(); welcome.Visibility = Visibility.Visible; Navigate(OverviewTab);

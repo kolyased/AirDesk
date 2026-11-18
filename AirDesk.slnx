@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AirDesk.Core/AirDesk.Core.csproj" />
+    <Project Path="src/AirDesk/AirDesk.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AirDesk.Tests.csproj" />
+  </Folder>
+</Solution>

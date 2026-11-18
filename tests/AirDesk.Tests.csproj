@@ -1,16 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><Nullable>enable</Nullable><EnableNETAnalyzers>true</EnableNETAnalyzers><AnalysisLevel>latest</AnalysisLevel><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup>
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
   <ItemGroup>
-    <Compile Include="../src/AirDesk/FanControl/FanPolicy.cs" Link="FanPolicy.cs" />
-    <Compile Include="../src/AirDesk/FanControl/CoolingSafety.cs" Link="CoolingSafety.cs" />
-    <Compile Include="../src/AirDesk/FanControl/CoolingProfiles.cs" Link="CoolingProfiles.cs" />
-    <Compile Include="../src/AirDesk/Models/Telemetry.cs" Link="Telemetry.cs" />
-    <Compile Include="../src/AirDesk/Models/DesktopLayout.cs" Link="DesktopLayout.cs" />
-    <Compile Include="../src/AirDesk/Models/HistoryModel.cs" Link="HistoryModel.cs" />
-    <Compile Include="../src/AirDesk/Models/NotificationRules.cs" Link="NotificationRules.cs" />
-    <Compile Include="../src/AirDesk/Persistence/HistoryStore.cs" Link="HistoryStore.cs" />
-    <Compile Include="../src/AirDesk/Persistence/UserPreferences.cs" Link="UserPreferences.cs" />
-    <Compile Include="../src/AirDesk/Persistence/AtomicJson.cs" Link="AtomicJson.cs" />
-    <Compile Include="../src/AirDesk/Diagnostics/DiagnosticLog.cs" Link="DiagnosticLog.cs" />
+    <ProjectReference Include="../src/AirDesk.Core/AirDesk.Core.csproj" />
   </ItemGroup>
 </Project>

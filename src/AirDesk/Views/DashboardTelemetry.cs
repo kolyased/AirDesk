@@ -55,6 +55,7 @@ public sealed partial class Dashboard
     {
         var panel = new DockPanel { Margin = new(0, 12, 0, 8) };
         var head = new StackPanel(); DockPanel.SetDock(head, Dock.Top); panel.Children.Add(head);
+        head.Children.Add(BuildDriverDiagnostics());
         diagnosticStatus.TextWrapping = TextWrapping.Wrap;
         head.Children.Add(diagnosticStatus);
         var actions = new WrapPanel(); head.Children.Add(actions);
@@ -233,7 +234,8 @@ public sealed partial class Dashboard
 
     string ReportText() => JsonSerializer.Serialize(new
     {
-        Captured = DateTimeOffset.Now, WindowVisible = IsVisible, DataStale = previousStale, Hardware = latest?.Cooling.Identity, Cooling = latest?.Cooling,
+        Captured = DateTimeOffset.Now, WindowVisible = IsVisible, DataStale = previousStale,
+        Driver = startupDriver, Hardware = latest?.Cooling.Identity, Cooling = latest?.Cooling,
         Polling = latest?.Polling, Readings = displayed?.Readings.Select(reading => previousStale && reading.Quality is ReadingQuality.Fresh or ReadingQuality.Unverified
             ? reading with { Quality = ReadingQuality.Stale } : reading), PollIssue = latest?.PollIssue
     }, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });

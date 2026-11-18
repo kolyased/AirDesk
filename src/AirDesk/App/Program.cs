@@ -9,6 +9,7 @@ namespace AirDesk;
 public static class Program
 {
     const string ActivationEvent = @"Local\AirDesk.Activate";
+    const string SetupMutex = @"Local\AirDesk.Setup";
     [STAThread]
     public static void Main(string[] args)
     {
@@ -22,11 +23,16 @@ public static class Program
         }
 
         bool autostart = args.Contains("--autostart");
+        if (SetupRunning())
+        {
+            if (!autostart) MessageBox.Show("Завершите установку или удаление AirDesk, затем запустите программу.");
+            return;
+        }
         bool smoke = args.Contains("--smoke") || args.Contains("--ui-smoke");
         bool benchmark = args.Contains("--benchmark");
         using var signal = new EventWaitHandle(false, EventResetMode.AutoReset, ActivationEvent);
         var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
-        var window = new Dashboard(autostart || benchmark, benchmark, args.Contains("--record-history"));
+        var window = new Dashboard(autostart || benchmark, benchmark, args.Contains("--record-history"), args.Contains("--monitor-only"));
         var activation = ThreadPool.RegisterWaitForSingleObject(signal, (_, _) =>
         {
             if (!app.Dispatcher.HasShutdownStarted) app.Dispatcher.BeginInvoke(window.ActivateFromSecondLaunch);
@@ -44,6 +50,17 @@ public static class Program
         window.Start(smoke, args.Contains("--ui-smoke"), benchmark);
         try { app.Run(); }
         finally { activation.Unregister(null); }
+    }
+
+    static bool SetupRunning()
+    {
+        try
+        {
+            if (!Mutex.TryOpenExisting(SetupMutex, out var setup)) return false;
+            setup.Dispose();
+            return true;
+        }
+        catch (UnauthorizedAccessException) { return true; }
     }
 
     static void ActivateExisting()

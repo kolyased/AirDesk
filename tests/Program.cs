@@ -1,7 +1,7 @@
 using System;
 using AirDesk;
 
-int scenarios = SafetyTests.Run() + DesktopLayoutTests.Run() + HistoryTests.Run();
+int scenarios = SafetyTests.Run() + DesktopLayoutTests.Run() + HistoryTests.Run() + ReleasePackageTests.Run();
 int points = 0;
 foreach (ProfileKind kind in new[] { ProfileKind.Quiet, ProfileKind.Balanced, ProfileKind.Performance })
 {

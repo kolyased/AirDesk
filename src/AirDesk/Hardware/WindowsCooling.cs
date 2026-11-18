@@ -4,7 +4,6 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Security.Principal;
 using System.Text.Json;
 using System.Threading;
 using LibreHardwareMonitor.Hardware;
@@ -101,7 +100,7 @@ internal sealed class WindowsCooling : IFanController, IDisposable
     const string TachometerId = ChipId + "/fan/1";
     const string TemperatureId = "/intelcpu/0/temperature/8";
     const string BusName = @"Global\Access_ISABUS.HTP.Method";
-    readonly Mutex writer = new(false, @"Global\AirDesk.Cooling.Owner");
+    Mutex? writer;
     Mutex? bus;
     Hardware? chip;
     ISensor? power;
@@ -121,11 +120,11 @@ internal sealed class WindowsCooling : IFanController, IDisposable
         using var board = Registry.LocalMachine.OpenSubKey(@"HARDWARE\DESCRIPTION\System\BIOS");
         string Field(string name) => (board?.GetValue(name) as string)?.Trim() ?? "";
         string vendor = Field("BaseBoardManufacturer"), model = Field("BaseBoardProduct"), revision = Field("BaseBoardVersion"), firmware = Field("BIOSVersion");
-        string? driver = DriverVersion();
-        bool administrator = new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
+        DriverStatus driverStatus = DriverStatus.Read();
+        string? driver = driverStatus.Version;
         chip = hardware.OfType<Hardware>().FirstOrDefault(h => h.HardwareType == HardwareType.SuperIO && h.Identifier.ToString() == ChipId);
-        if (!administrator) ReadIssue = "Недостаточно прав администратора. Для управления откройте AirDesk.exe через «Запуск от имени администратора».";
-        else if (driver == null) ReadIssue = "Драйвер PawnIO не найден или его файл недоступен.";
+        if (driver == null) ReadIssue = driverStatus.Description;
+        else if (!driverStatus.Elevated) ReadIssue = "Недостаточно прав администратора. Для управления откройте AirDesk.exe через «Запуск от имени администратора».";
         else if (vendor != "INTEL" || model != "X99-XD4" || revision != "V2.0" || firmware != "5.11" ||
             library != "0.9.6.0" || driver != "2.2.0")
             ReadIssue = $"Только мониторинг. Нет проверенного определения для {vendor} {model} {revision}, BIOS {firmware}, PawnIO {driver}.";
@@ -163,18 +162,6 @@ internal sealed class WindowsCooling : IFanController, IDisposable
         return method?.CreateDelegate<Action<int, byte?>>(backend);
     }
 
-    internal static string? DriverVersion()
-    {
-        using var service = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\PawnIO");
-        if (service?.GetValue("ImagePath") is not string path) return null;
-        const string root = @"\SystemRoot\";
-        if (path.StartsWith(root, StringComparison.OrdinalIgnoreCase))
-            path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), path[root.Length..]);
-        if (path.StartsWith(@"\??\", StringComparison.Ordinal)) path = path[4..];
-        path = Environment.ExpandEnvironmentVariables(path.Trim('"'));
-        return File.Exists(path) ? FileVersionInfo.GetVersionInfo(path).FileVersion : null;
-    }
-
     public void Update(IHardware hardware)
     {
         if (hardware != chip || Identity == null) { hardware.Update(); return; }
@@ -201,6 +188,7 @@ internal sealed class WindowsCooling : IFanController, IDisposable
     public void Acquire()
     {
         if (power?.Control == null || setControl == null) throw new InvalidOperationException("Канал записи недоступен.");
+        writer ??= new Mutex(false, @"Global\AirDesk.Cooling.Owner");
         try { leased = writer.WaitOne(0); }
         catch (AbandonedMutexException) { writer.ReleaseMutex(); throw new InvalidOperationException("Предыдущий владелец канала завершился аварийно."); }
         if (!leased) throw new InvalidOperationException("Канал занят другим экземпляром AirDesk.");
@@ -268,6 +256,6 @@ internal sealed class WindowsCooling : IFanController, IDisposable
         finally { bus.ReleaseMutex(); }
     }
 
-    public void ReleaseLease() { if (leased) { writer.ReleaseMutex(); leased = false; } }
-    public void Dispose() { ReleaseLease(); bus?.Dispose(); writer.Dispose(); }
+    public void ReleaseLease() { if (leased) { writer!.ReleaseMutex(); leased = false; } }
+    public void Dispose() { ReleaseLease(); bus?.Dispose(); writer?.Dispose(); }
 }

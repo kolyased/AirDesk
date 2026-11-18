@@ -24,6 +24,7 @@ public sealed partial class Dashboard : Window
     readonly DashboardViewModel viewModel;
     readonly UserPreferences preferences = UserPreferences.Load();
     readonly bool autostartSession;
+    readonly DriverStatus startupDriver = DriverStatus.Read();
     readonly TabControl tabs = new() { BorderThickness = new(0) };
     readonly TextBlock status = Text("Подключение к датчикам…", 13), statusHeading = Text("Мониторинг", 15),
         statusTime = Text("", 12), setupEquipment = Text("Оборудование опрашивается…", 13), activeSummary = Text("Управление BIOS/EC", 14);
@@ -44,10 +45,10 @@ public sealed partial class Dashboard : Window
     bool? warningColor;
     public bool StartMinimized => preferences.StartMinimized;
 
-    public Dashboard(bool autostart, bool benchmark = false, bool recordHistory = false)
+    public Dashboard(bool autostart, bool benchmark = false, bool recordHistory = false, bool monitorOnly = false)
     {
         autostartSession = autostart;
-        viewModel = new DashboardViewModel(autostart,
+        viewModel = new DashboardViewModel(autostart || monitorOnly,
             benchmark ? System.IO.Path.Combine(AppContext.BaseDirectory, "benchmark-history") : null);
         DataContext = viewModel;
         viewModel.ConfigureHistory(benchmark ? recordHistory ? HistoryRetention.Hour : HistoryRetention.Off : preferences.Retention);
@@ -211,7 +212,7 @@ public sealed partial class Dashboard : Window
             renderedTelemetry = displayed;
             renderedStale = stale;
             RenderTelemetry(displayed, stale, newData);
-            setupEquipment.Text = $"Найдено: {string.Join(", ", displayed.Devices.Where(device => device.Type != "Memory").Select(device => device.Name).Distinct().Take(6))}.\n{driverStatus}";
+            setupEquipment.Text = $"Найдено: {string.Join(", ", displayed.Devices.Where(device => device.Type != "Memory").Select(device => device.Name).Distinct().Take(6))}.\n{startupDriver.Description}";
         }
         RenderSystem(latest, stale);
         if (IsVisible) RenderCooling(latest.Cooling, stale);
@@ -223,6 +224,12 @@ public sealed partial class Dashboard : Window
     void RenderSystem(Snapshot snapshot, bool stale)
     {
         var state = snapshot.Cooling.State;
+        if (driverAccess.IsVisible)
+        {
+            string access = snapshot.Telemetry.Devices.Any(device => device.Type == "SuperIO") ? "Датчики Super I/O обнаружены." : "Датчики Super I/O не обнаружены.";
+            string detail = $"{access} {snapshot.Cooling.Reason}";
+            if (driverAccess.Text != detail) driverAccess.Text = detail;
+        }
         string heading = stale || snapshot.PollIssue != null ? "Сбой датчиков" : state switch
         {
             ChannelState.Conflict => "Конфликт управления",
@@ -319,6 +326,7 @@ public sealed partial class Dashboard : Window
     {
         if (shellDisposed) return;
         shellDisposed = true;
+        updateRequest?.Cancel();
         refresh.Stop(); debounce.Stop();
         SystemEvents.UserPreferenceChanged -= OnSystemPreferenceChanged;
         DisposeTray();
@@ -331,10 +339,10 @@ public sealed partial class Dashboard : Window
         label.SetResourceReference(TextBlock.ForegroundProperty, size <= 12 ? AppTheme.Muted : AppTheme.Text);
         return label;
     }
-    static Button Button(string text, Action action, string? tip = null)
+    static Button Button(string text, Action? action = null, string? tip = null)
     {
         var button = new Button { Content = text, Padding = new(10, 6, 10, 6), MinHeight = 32, Margin = new(0, 0, 8, 6), ToolTip = tip };
-        button.Click += (_, _) => action();
+        if (action != null) button.Click += (_, _) => action();
         return button;
     }
     static void NameForAutomation(DependencyObject element, string name) => AutomationProperties.SetName(element, name);

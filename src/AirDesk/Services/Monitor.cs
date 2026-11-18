@@ -132,7 +132,7 @@ public sealed class Monitor
                         // A delayed poll must not revive a test or a stale control session.
                         safety.TickBeforeSample();
                         safety.Observe(monitorOnly ? new FanSample(null, null, null, null, false,
-                            "AirDesk запущен вместе с Windows. В этом сеансе доступен мониторинг.") : adapter.Sample(telemetry));
+                            "В этом сеансе доступен только мониторинг.") : adapter.Sample(telemetry));
                         safety.Tick();
                         if (!tooSlow)
                         {
