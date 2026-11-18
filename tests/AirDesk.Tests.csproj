@@ -5,6 +5,7 @@
     <Compile Include="../src/AirDesk/CoolingSafety.cs" Link="CoolingSafety.cs" />
     <Compile Include="../src/AirDesk/CoolingProfiles.cs" Link="CoolingProfiles.cs" />
     <Compile Include="../src/AirDesk/Telemetry.cs" Link="Telemetry.cs" />
+    <Compile Include="../src/AirDesk/DesktopLayout.cs" Link="DesktopLayout.cs" />
     <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
   </ItemGroup>
 </Project>

@@ -11,6 +11,11 @@ public sealed class UserPreferences
     public Dictionary<string, string> Aliases { get; init; } = new(StringComparer.Ordinal);
     public List<SavedProfile> Profiles { get; init; } = new();
     public string? Gpu { get; set; }
+    public Appearance Theme { get; set; } = Appearance.System;
+    public bool StartMinimized { get; set; }
+    public bool WelcomeDismissed { get; set; }
+    public CardSetting[] Cards { get; set; } = DesktopLayout.DefaultCards();
+    public TrayMetric[] Tooltip { get; set; } = DesktopLayout.DefaultTooltip();
     static readonly string Pathname = Path.Combine(LocalCalibration.Folder, "monitor-preferences-v1.json");
 
     public static UserPreferences Load()
@@ -20,6 +25,9 @@ public sealed class UserPreferences
             if (!File.Exists(Pathname)) return new();
             var saved = JsonSerializer.Deserialize<UserPreferences>(File.ReadAllText(Pathname));
             if (saved?.Aliases == null || saved.Profiles == null) return new();
+            saved.Theme = Enum.IsDefined(saved.Theme) ? saved.Theme : Appearance.System;
+            saved.Cards = DesktopLayout.NormalizeCards(saved.Cards);
+            saved.Tooltip = (saved.Tooltip ?? DesktopLayout.DefaultTooltip()).Where(value => Enum.IsDefined(value)).Distinct().ToArray();
             saved.Profiles.RemoveAll(entry => entry?.Current == null || !Curve.Valid(entry.Current));
             for (int index = 0; index < saved.Profiles.Count; index++)
             {

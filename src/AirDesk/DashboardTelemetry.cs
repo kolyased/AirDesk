@@ -19,13 +19,18 @@ public sealed partial class Dashboard
     readonly TextBlock detailTitle = Text("", 14), diagnosticStatus = Text("", 12);
     bool previousStale, updatingDeviceChoices;
     record DeviceOption(string Id, string Label) { public override string ToString() => Label; }
-    record ReadingRow(string? Key, string Name, string Value, string Quality, string Time, string Original, string Source, string Section = "");
+    record ReadingRow(string? Key, string Name, string Value, string Quality, string Time, string Original, string Source, string Section = "")
+    {
+        public string Hint => $"Исходное имя: {Original}\nИсточник: {Source}\nКачество: {Quality}" + (Key == null ? "" : $"\nID: {Key}");
+    }
 
     FrameworkElement BuildDevices()
     {
         var panel = new DockPanel { Margin = new(0, 12, 0, 8) };
         var head = new StackPanel(); DockPanel.SetDock(head, Dock.Top); panel.Children.Add(head);
         var controls = new WrapPanel(); head.Children.Add(controls);
+        NameForAutomation(deviceChoice, "Устройство для подробного просмотра");
+        NameForAutomation(gpuChoice, "Видеокарта на вкладке обзора");
         controls.Children.Add(deviceChoice);
         controls.Children.Add(Button("Переименовать устройство", () => { if (deviceChoice.SelectedItem is DeviceOption option) Alias(option.Id, option.Label); }));
         controls.Children.Add(Button("Переименовать датчик", () => RenameReading(deviceTable)));
@@ -42,6 +47,7 @@ public sealed partial class Dashboard
         };
         ConfigureReadings(deviceTable, false); panel.Children.Add(deviceTable);
         deviceTable.Columns.Insert(0, deviceSection);
+        panel.IsVisibleChanged += (_, _) => { if (panel.IsVisible) RefreshDevice(); };
         return panel;
     }
 
@@ -64,12 +70,18 @@ public sealed partial class Dashboard
     {
         table.IsReadOnly = true; table.AutoGenerateColumns = false; table.CanUserAddRows = false;
         table.SelectionMode = DataGridSelectionMode.Single; table.HeadersVisibility = DataGridHeadersVisibility.Column;
-        table.Background = Panel; table.RowBackground = Panel; table.AlternatingRowBackground = Brush("#202A38");
-        table.Foreground = Brushes.White; table.BorderThickness = new(0);
+        table.SetResourceReference(BackgroundProperty, AppTheme.Surface);
+        table.SetResourceReference(DataGrid.RowBackgroundProperty, AppTheme.Surface);
+        table.SetResourceReference(DataGrid.AlternatingRowBackgroundProperty, AppTheme.Alternate);
+        table.BorderThickness = new(0);
+        NameForAutomation(table, raw ? "Все показания оборудования" : "Показания выбранного устройства");
+        var rows = new Style(typeof(DataGridRow));
+        rows.Setters.Add(new Setter(ToolTipProperty, new Binding(nameof(ReadingRow.Hint))));
+        table.RowStyle = rows;
         table.GridLinesVisibility = DataGridGridLinesVisibility.None;
         foreach (var (title, field, width) in new[] { ("Показатель", "Name", 230), ("Значение", "Value", 125),
             ("Статус", "Quality", 170), ("Обновлено", "Time", 95), ("Исходное имя", "Original", 155), (raw ? "Источник и ID" : "Источник", "Source", raw ? 360 : 175) })
-            table.Columns.Add(new DataGridTextColumn { Header = title, Binding = new Binding(field), Width = width });
+            if (raw || field != "Original") table.Columns.Add(new DataGridTextColumn { Header = title, Binding = new Binding(field), Width = width });
     }
 
     void RenderTelemetry(Telemetry data, bool stale, bool newData)
@@ -92,11 +104,12 @@ public sealed partial class Dashboard
         }
         while (history.TryPeek(out var first) && DateTimeOffset.Now - first.Time > TimeSpan.FromSeconds(60)) history.Dequeue();
         DrawGraph();
-        var cooling = latest?.Cooling;
-        flyText.Text = $"CPU   {Format(load, "%")} · {Format(cpuTemperature, "°C")}\nGPU   {gpuValue.Text} · {Format(gpuTemperature, "°C")}\nRAM   {ramValue.Text}\n" +
-            $"{cooling?.Group ?? "Тахометр"}   {Format(stale ? null : cooling?.Rpm, "об/мин")}\n" +
-            (stale ? "Данные устарели" : cooling?.Conflict != null ? "Конфликт управления" : cooling?.State == ChannelState.Controlled ? "Управление AirDesk" : "Мониторинг");
-        tray.Text = $"AirDesk | CPU {Format(cpuTemperature, "°C")} | GPU {Format(gpuTemperature, "°C")}";
+        cards[OverviewCard.Cpu].ToolTip = CardHint("Загрузка", data.Cpu?.Load, "Температура", data.Cpu?.Temperature, stale);
+        cards[OverviewCard.Gpu].ToolTip = CardHint("Загрузка", gpu?.Load, "Температура ядра", gpu?.Temperature, stale) +
+            "\nГорячая точка показывает максимальную температуру внутри кристалла, если датчик доступен.";
+        cards[OverviewCard.Memory].ToolTip = CardHint("Занято", data.Ram?.Load, "Объём", data.Ram?.MemoryUsed, stale);
+        cards[OverviewCard.Storage].ToolTip = CardHint("Активность", data.Disks.Select(device => device.Load).Where(reading => reading?.Available == true)
+            .MaxBy(reading => reading?.Value), "Температура", hottestDisk?.Temperature, stale);
         var newSources = data.CurveSources.Select(source => stale ? source with { Celsius = null } : source).ToArray();
         if (!sources.Select(source => (source.Source, source.Label, source.Celsius.HasValue))
             .SequenceEqual(newSources.Select(source => (source.Source, source.Label, source.Celsius.HasValue))))
@@ -105,8 +118,15 @@ public sealed partial class Dashboard
             SetProfileFields();
         }
         UpdateDevices(data);
-        RefreshDevice();
+        if (deviceTable.IsVisible) RefreshDevice();
         if (diagnosticTable.IsVisible) RefreshDiagnostics();
+    }
+
+    static string CardHint(string first, Reading? firstReading, string second, Reading? secondReading, bool stale)
+    {
+        static string Describe(Reading? reading, bool stale) => reading == null ? "датчик недоступен" :
+            $"{reading.Source} · {(stale ? "устарело" : QualityText(reading.Quality))}\n{reading.Id}";
+        return $"{first}: {Describe(firstReading, stale)}\n{second}: {Describe(secondReading, stale)}";
     }
 
     void UpdateDevices(Telemetry data)
@@ -244,9 +264,18 @@ public sealed partial class Dashboard
     Window Dialog(string title, double width, double height, out StackPanel content)
     {
         content = new StackPanel { Margin = new(18) };
-        return new Window { Title = title, Owner = this, Width = width, Height = height, Background = Panel, Foreground = Brushes.White,
+        var window = new Window { Title = title, Owner = this, Width = width, Height = height, MaxWidth = SystemParameters.WorkArea.Width,
+            MaxHeight = SystemParameters.WorkArea.Height,
             WindowStartupLocation = WindowStartupLocation.CenterOwner, ShowInTaskbar = false,
             Content = new ScrollViewer { Content = content, VerticalScrollBarVisibility = ScrollBarVisibility.Auto } };
+        window.SetResourceReference(BackgroundProperty, AppTheme.Surface);
+        window.SetResourceReference(ForegroundProperty, AppTheme.Text);
+        window.PreviewKeyDown += (_, e) =>
+        {
+            if (e.Key != System.Windows.Input.Key.Escape) return;
+            window.DialogResult = false; e.Handled = true;
+        };
+        return window;
     }
 
     static TextBox Field(Panel panel, string title, string value, int max)

@@ -180,7 +180,7 @@ internal sealed class WindowsCooling : ICoolingOutput, IDisposable
         return method?.CreateDelegate<Action<int, byte?>>(backend);
     }
 
-    static string? DriverVersion()
+    internal static string? DriverVersion()
     {
         using var service = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\PawnIO");
         if (service?.GetValue("ImagePath") is not string path) return null;

@@ -14,6 +14,7 @@ public record Snapshot(DateTimeOffset Time, Telemetry Telemetry, CoolingView Coo
 
 public sealed class Monitor
 {
+    readonly bool monitorOnly;
     readonly ConcurrentQueue<(Action<CoolingSafety> Action, TaskCompletionSource<string> Result)> commands = new();
     readonly AutoResetEvent wake = new(false);
     readonly TaskCompletionSource<CoolingView?> finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -22,6 +23,7 @@ public sealed class Monitor
     int stopping, releaseRequested, watchdogReported;
     volatile Snapshot? latest;
     public Snapshot? Latest => latest;
+    public Monitor(bool monitorOnly = false) => this.monitorOnly = monitorOnly;
     public bool Stalled => Volatile.Read(ref stopping) == 0 && elapsed.ElapsedTicks - Interlocked.Read(ref lastProgress) >=
         (long)(Stopwatch.Frequency * CoolingSafety.Freshness.TotalSeconds);
 
@@ -143,7 +145,8 @@ public sealed class Monitor
                         if (pollIssue != null) safety.Interrupt(pollIssue, true);
                         // A delayed poll must not revive a test or a stale control session.
                         safety.TickBeforeSample();
-                        safety.Observe(adapter.Sample(telemetry));
+                        safety.Observe(monitorOnly ? new FanSample(null, null, null, null, false,
+                            "AirDesk запущен вместе с Windows. В этом сеансе доступен мониторинг.") : adapter.Sample(telemetry));
                         safety.Tick();
                     }
                     catch (Exception error)
