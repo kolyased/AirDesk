@@ -21,18 +21,18 @@ if ($ExpectNoPawnIO -and (Test-Path 'HKLM:/SYSTEM/CurrentControlSet/Services/Paw
     throw 'This test requires Windows without PawnIO.'
 }
 
-function Wait-App([Diagnostics.Process]$Process) {
-    if (!$Process.WaitForExit(45000)) {
+function Wait-App([Diagnostics.Process]$Process, [string]$Phase, [int]$TimeoutMilliseconds = 45000) {
+    if (!$Process.WaitForExit($TimeoutMilliseconds)) {
         $Process.Kill()
-        throw 'The monitor-only test copy took too long to exit.'
+        throw "The monitor-only process timed out in $Phase."
     }
-    if ($Process.ExitCode -ne 0) { throw "AirDesk exited with code $($Process.ExitCode)." }
+    if ($Process.ExitCode -ne 0) { throw "AirDesk exited with code $($Process.ExitCode) in $Phase." }
 }
 
 $report = Join-Path $folder 'ui-smoke.json'
 $started = (Get-Date).ToUniversalTime()
 $app = Start-Process -FilePath $file.FullName -ArgumentList '--ui-smoke','--monitor-only','--record-history' -WindowStyle Hidden -PassThru
-Wait-App $app
+Wait-App $app 'WPF smoke'
 if (!(Test-Path $report) -or (Get-Item $report).LastWriteTimeUtc -lt $started) { throw 'No current WPF report.' }
 $renderings = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
 $scales = ($renderings.dpi | Sort-Object) -join ','
@@ -54,16 +54,28 @@ if (!(Test-Path -LiteralPath $historyPath) -or ((Get-Content -LiteralPath $histo
 
 $tray = Start-Process -FilePath $file.FullName -ArgumentList '--benchmark','--tray','--monitor-only' -WindowStyle Hidden -PassThru
 try {
-    Start-Sleep -Seconds 4
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(15)
+    $ready = $false
+    while (!$tray.HasExited -and [DateTimeOffset]::UtcNow -lt $deadline) {
+        $activation = $null
+        if ([Threading.EventWaitHandle]::TryOpenExisting('Local\AirDesk.Activate', [ref]$activation)) {
+            $activation.Dispose()
+            $ready = $true
+            break
+        }
+        Start-Sleep -Milliseconds 150
+    }
+    if (!$ready) { throw 'The tray instance did not register its activation event.' }
+    'PASS: tray registered activation'
     $tray.Refresh()
     if ($tray.HasExited -or $tray.MainWindowHandle -ne [IntPtr]::Zero) { throw 'The tray instance started with a visible window.' }
     $soak = Start-Process -FilePath $file.FullName -ArgumentList '--soak' -WindowStyle Hidden -PassThru
-    Wait-App $soak
+    Wait-App $soak 'rejection of the duplicate soak command' 12000
     $tray.Refresh()
     if ($tray.HasExited -or $tray.MainWindowHandle -ne [IntPtr]::Zero) { throw 'The soak command disturbed the active tray instance.' }
     $second = Start-Process -FilePath $file.FullName -ArgumentList '--monitor-only' -WindowStyle Hidden -PassThru
-    Wait-App $second
-    Wait-App $tray
+    Wait-App $second 'activation from a second launch' 12000
+    Wait-App $tray 'tray benchmark shutdown'
     $visible = Get-Content -LiteralPath (Join-Path $folder 'benchmark.json') -Raw | ConvertFrom-Json
     if (!$visible.WindowVisible -or $visible.Readings.Count -eq 0) { throw 'Second launch failed to reopen the tray instance.' }
 }
