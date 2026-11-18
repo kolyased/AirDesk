@@ -1,109 +1,219 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using LibreHardwareMonitor.Hardware;
 
 namespace AirDesk;
-public record Reading(string Device, string Name, string Kind, float? Value, string Id);
-public record Snapshot(DateTime Time, Reading[] Readings, string Status, bool Conflict, string ControlStatus, string? HubId, float? HubRpm, float? Command, string TestResult);
-public class Monitor : IDisposable
+
+public record Snapshot(DateTimeOffset Time, Telemetry Telemetry, CoolingView Cooling, string? PollIssue);
+
+public sealed class Monitor
 {
-    readonly Computer computer = new() { IsCpuEnabled=true, IsMotherboardEnabled=true, IsMemoryEnabled=true, IsGpuEnabled=true, IsStorageEnabled=true, IsNetworkEnabled=true };
-    readonly object gate = new();
-    readonly Dictionary<string, ISensor> controls = new();
-    readonly Dictionary<string, (bool Auto, float Percent)> owned = new();
-    readonly Dictionary<string, float> previous = new();
-    Timer? timer;
-    bool disposed;
-    string? hubId;
-    float? hubRpm;
-    string controlStatus="Управление BIOS";
-    string testResult="";
-    DateTime? testStarted;
-    float? testBefore;
-    (bool Auto,float Percent)? beforeMode;
-    public event Action<Snapshot>? Updated;
-    public static bool Conflict => Process.GetProcessesByName("FanControl").Length > 0 || Process.GetProcessesByName("MSIAfterburner").Length > 0;
-    public void Start() { lock(gate) { computer.Open(); } timer = new Timer(_ => Poll(),null,0,1000); }
-    static IEnumerable<IHardware> Walk(IHardware h) { yield return h; foreach(var s in h.SubHardware) foreach(var x in Walk(s)) yield return x; }
-    public string Apply(string id, bool automatic, float percent)
+    readonly ConcurrentQueue<(Action<CoolingSafety> Action, TaskCompletionSource<string> Result)> commands = new();
+    readonly AutoResetEvent wake = new(false);
+    readonly TaskCompletionSource<CoolingView?> finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    readonly Stopwatch elapsed = Stopwatch.StartNew();
+    long lastProgress, testDeadline;
+    int stopping, releaseRequested, watchdogReported;
+    volatile Snapshot? latest;
+    public Snapshot? Latest => latest;
+    public bool Stalled => Volatile.Read(ref stopping) == 0 && elapsed.ElapsedTicks - Interlocked.Read(ref lastProgress) >=
+        (long)(Stopwatch.Frequency * CoolingSafety.Freshness.TotalSeconds);
+
+    public void Start()
     {
-        lock(gate) {
-            if(disposed) return "Мониторинг остановлен.";
-            if(Conflict) return "Закройте FanControl / MSI Afterburner перед включением управления.";
-            if(!controls.TryGetValue(id,out var s) || s.Control == null) return "Канал управления недоступен.";
-            if(testStarted.HasValue) return "Дождитесь окончания проверки.";
-            if(id!=hubId) return "Этот канал не выбран как общий контроллер.";
-            owned[id]=(automatic,Math.Clamp(percent,40,100));
-            controlStatus="Команда принята, ожидается запись…";
-            return controlStatus;
-        }
+        new Thread(Run) { Name = "AirDesk hardware executor", IsBackground = true }.Start();
     }
-    public string TestHub() {
-        lock(gate) {
-            if(Conflict) return "Сначала закройте FanControl / MSI Afterburner.";
-            if(hubId==null || !hubRpm.HasValue) return "Нет доступного контроллера или показаний оборотов.";
-            if(testStarted.HasValue) return "Проверка уже выполняется.";
-            testResult="";beforeMode=owned.TryGetValue(hubId,out var m)?m:null;
-            testBefore=hubRpm;testStarted=DateTime.UtcNow;
-            owned[hubId]=(false,100);controlStatus="Проверка: 100% на 8 секунд…";
-            return controlStatus;
-        }
+
+    public Task<string> Submit(Action<CoolingSafety> action)
+    {
+        if (Volatile.Read(ref stopping) != 0 || finished.Task.IsCompleted || Stalled)
+            return Task.FromResult("Исполнитель недоступен. Проверьте состояние драйвера.");
+        if (commands.Count >= 8) return Task.FromResult("Исполнитель занят. Дождитесь окончания команды.");
+        var result = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        commands.Enqueue((action, result));
+        wake.Set();
+        return result.Task;
     }
-    public void Release(string? id=null) {
-        lock(gate) {
-            foreach(var k in owned.Keys.ToArray()) if(id==null || id==k) {
-                // Keep ownership on failure so the next poll retries restoration.
-                controls[k].Control!.SetDefault(); owned.Remove(k); previous.Remove(k);
+
+    public void Release()
+    {
+        Interlocked.Exchange(ref releaseRequested, 1);
+        wake.Set();
+    }
+
+    public async Task<CoolingView?> ShutdownAsync()
+    {
+        Interlocked.Exchange(ref stopping, 1);
+        wake.Set();
+        return await finished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    void Run()
+    {
+        var computer = new Computer { IsCpuEnabled = true, IsMotherboardEnabled = true, IsMemoryEnabled = true,
+            IsGpuEnabled = true, IsStorageEnabled = true };
+        CoolingSafety? safety = null;
+        WindowsCooling? adapter = null;
+        Telemetry telemetry = Telemetry.Empty;
+        string? pollIssue = null;
+        bool StopPending() => Volatile.Read(ref stopping) != 0 || Volatile.Read(ref releaseRequested) != 0;
+        try
+        {
+            adapter = new WindowsCooling();
+            using var deadline = new Timer(_ =>
+            {
+                long due = Interlocked.Read(ref testDeadline);
+                if (due != 0 && elapsed.Elapsed.Ticks >= due) wake.Set();
+                if (Stalled && safety?.OwnsOutput == true && Interlocked.Exchange(ref watchdogReported, 1) == 0)
+                {
+                    Interlocked.Exchange(ref releaseRequested, 1);
+                    wake.Set();
+                    LogEvent("Аппаратный вызов просрочен. Возврат запрошен, выполнение ожидает освобождения драйвера.");
+                }
+            }, null, 100, 100);
+            safety = new(adapter, new LocalCalibration(), ControllerProcesses.Scan, () => elapsed.Elapsed, LogEvent, StopPending);
+            computer.Open();
+            adapter.Discover(computer.Hardware.SelectMany(Walk).ToArray());
+            TimeSpan nextPoll = TimeSpan.Zero, nextTick = TimeSpan.Zero, nextDiscovery = elapsed.Elapsed + TimeSpan.FromSeconds(5);
+            while (!safety.ShutdownComplete)
+            {
+                Interlocked.Exchange(ref lastProgress, elapsed.ElapsedTicks);
+                Interlocked.Exchange(ref watchdogReported, 0);
+                if (Volatile.Read(ref stopping) != 0) safety.Close();
+                if (Interlocked.Exchange(ref releaseRequested, 0) != 0)
+                {
+                    CancelQueued();
+                    safety.Stop("пользователь вернул управление BIOS/EC");
+                    nextTick = TimeSpan.Zero;
+                }
+                bool expired = safety.Deadline is { } due && elapsed.Elapsed >= due;
+                if (elapsed.Elapsed >= nextTick || expired || Volatile.Read(ref stopping) != 0)
+                {
+                    safety.Tick();
+                    nextTick = elapsed.Elapsed + TimeSpan.FromMilliseconds(200);
+                }
+                Publish();
+                if (safety.ShutdownComplete) break;
+
+                if (Volatile.Read(ref stopping) == 0 && commands.TryDequeue(out var command))
+                {
+                    try { command.Action(safety); command.Result.TrySetResult(""); }
+                    catch (Exception error) { Log(error); command.Result.TrySetResult(error.Message); }
+                    Publish();
+                }
+
+                if (Volatile.Read(ref stopping) == 0 && elapsed.Elapsed >= nextPoll && safety.View().State != ChannelState.Restoring)
+                {
+                    TimeSpan started = elapsed.Elapsed;
+                    try
+                    {
+                        var readings = new List<Reading>();
+                        var available = computer.Hardware.SelectMany(Walk).ToArray();
+                        if (adapter.RetryDiscovery && elapsed.Elapsed >= nextDiscovery)
+                        {
+                            adapter.Discover(available);
+                            nextDiscovery = elapsed.Elapsed + TimeSpan.FromSeconds(5);
+                        }
+                        foreach (var hardware in available)
+                        {
+                            DateTimeOffset now = DateTimeOffset.UtcNow;
+                            try
+                            {
+                                adapter.Update(hardware);
+                                var quality = hardware.HardwareType == HardwareType.SuperIO && adapter.BoardUpdateBlocked ? ReadingQuality.Stale : ReadingQuality.Fresh;
+                                readings.AddRange(hardware.Sensors.Select(sensor => Reading.From(hardware, sensor, now, quality)));
+                            }
+                            catch (Exception error)
+                            {
+                                Log(error);
+                                readings.AddRange(hardware.Sensors.Select(sensor => Reading.From(hardware, sensor, now,
+                                    error is UnauthorizedAccessException ? ReadingQuality.AccessDenied : ReadingQuality.Unresponsive)));
+                            }
+                        }
+                        pollIssue = elapsed.Elapsed - started >= CoolingSafety.Freshness ? "Опрос оборудования превысил допустимое время." : null;
+                        telemetry = new Telemetry(readings.ToArray());
+                        if (pollIssue != null) safety.Interrupt(pollIssue, true);
+                        // A delayed poll must not revive a test or a stale control session.
+                        safety.TickBeforeSample();
+                        safety.Observe(adapter.Sample(telemetry));
+                        safety.Tick();
+                    }
+                    catch (Exception error)
+                    {
+                        Log(error);
+                        pollIssue = "Сбой опроса: " + error.Message;
+                        safety.Interrupt(pollIssue, true);
+                        safety.Tick();
+                    }
+                    nextPoll = elapsed.Elapsed + TimeSpan.FromMilliseconds(850);
+                    Publish();
+                }
+                wake.WaitOne(100);
             }
-            if(id==null) {testStarted=null;controlStatus="Управление возвращено BIOS";}
+
+            void Publish()
+            {
+                Interlocked.Exchange(ref testDeadline, safety.Deadline?.Ticks ?? 0);
+                latest = new(DateTimeOffset.Now, telemetry, safety.View(), pollIssue);
+            }
         }
-    }
-    void Poll() {
-        if(!System.Threading.Monitor.TryEnter(gate)) return;
-        try {
-            if(disposed) return;
-            var readings = new List<Reading>();
-            foreach(var h in computer.Hardware.SelectMany(Walk)) {
-                h.Update();
-                foreach(var s in h.Sensors) {
-                    float? value=s.Value.HasValue && float.IsFinite(s.Value.Value) ? s.Value : null;
-                    readings.Add(new(h.Name,s.Name,s.SensorType.ToString(),value,s.Identifier.ToString()));
-                    if(h.HardwareType==HardwareType.SuperIO && s.SensorType==SensorType.Control && s.Control!=null) controls[s.Identifier.ToString()]=s;
+        catch (Exception error)
+        {
+            Log(error);
+            if (safety?.OwnsOutput == true)
+            {
+                safety.Close();
+                var until = elapsed.Elapsed + TimeSpan.FromSeconds(3);
+                while (!safety.ShutdownComplete && elapsed.Elapsed < until)
+                {
+                    safety.Tick();
+                    if (!safety.ShutdownComplete) Thread.Sleep(100);
                 }
             }
-            bool conflict=Conflict;
-            if(conflict && owned.Count>0) Release();
-            // This board's saved FanControl calibration identifies Fan #2 as responsive.
-            // No blind fallback to a different header on other motherboards.
-            hubId=controls.Keys.FirstOrDefault(k=>k.Contains("/nct6779d/") && k.EndsWith("/control/1"));
-            hubRpm=hubId==null?null:readings.FirstOrDefault(r=>r.Id==hubId.Replace("/control/","/fan/"))?.Value;
-            float? cpu=readings.FirstOrDefault(r=>r.Id.StartsWith("/intelcpu/") && r.Name=="CPU Package")?.Value
-                ?? readings.FirstOrDefault(r=>r.Id.StartsWith("/amdcpu/") && r.Kind=="Temperature" && r.Name.Contains("Tctl"))?.Value;
-            foreach(var (id,mode) in owned) {
-                float target=FanPolicy.Target(cpu,mode.Auto,mode.Percent);
-                // Fast rise, slow fall; emergency always bypasses smoothing.
-                if(previous.TryGetValue(id,out float old) && target<old) target=Math.Max(target,old-2);
-                controls[id].Control!.SetSoftware(target); previous[id]=target;
-                if(!testStarted.HasValue) controlStatus=$"Записано {target:0}% · {(mode.Auto?"авто по CPU":"ручной режим")} · фактически {hubRpm:0} об/мин";
-            }
-            if(testStarted.HasValue && (DateTime.UtcNow-testStarted.Value).TotalSeconds>=8 && hubId!=null) {
-                string result=$"Проверка: {testBefore:0} → {hubRpm:0} об/мин. ";
-                result+=hubRpm>testBefore*1.10f?"Рост оборотов подтверждён.":"Заметного роста нет: уже максимум или хаб не реагирует на PWM.";
-                if(beforeMode.HasValue) owned[hubId]=beforeMode.Value;else Release(hubId);
-                testStarted=null;testResult=result;controlStatus=result;
-            }
-            Updated?.Invoke(new(DateTime.Now,readings.ToArray(), conflict ? "Мониторинг • закройте другую программу управления" : owned.Count>0 ? "Управление активно" : "Мониторинг • управление BIOS",conflict,controlStatus,hubId,hubRpm,hubId!=null&&previous.TryGetValue(hubId,out var cmd)?cmd:null,testResult));
-        } catch(Exception e) {
-            foreach(var id in owned.Keys) try { controls[id].Control!.SetSoftware(100); } catch { }
-            Log(e);
-            controlStatus="Ошибка записи/чтения: "+e.Message;
-            Updated?.Invoke(new(DateTime.Now,Array.Empty<Reading>(),"Ошибка датчиков: " + e.Message,Conflict,controlStatus,hubId,null,null,testResult));
-        } finally { System.Threading.Monitor.Exit(gate); }
+            var previous = latest;
+            if (safety != null) latest = new(DateTimeOffset.Now, previous?.Telemetry ?? Telemetry.Empty, safety.View(), error.Message);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref stopping, 1);
+            CancelQueued();
+            try { computer.Close(); }
+            catch (Exception error) { Log(error); }
+            finally { adapter?.Dispose(); }
+            finished.TrySetResult(safety?.View());
+        }
     }
-    public static void Log(Exception e) { try { string p=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"AirDesk"); Directory.CreateDirectory(p); File.AppendAllText(Path.Combine(p,"errors.log"),DateTime.Now+" "+e+Environment.NewLine); } catch {} }
-    public void Dispose() { timer?.Dispose(); lock(gate) { try { Release(); } finally { disposed=true; computer.Close(); } } }
+
+    void CancelQueued()
+    {
+        while (commands.TryDequeue(out var item)) item.Result.TrySetResult("Команда отменена.");
+    }
+
+    static IEnumerable<IHardware> Walk(IHardware hardware)
+    {
+        yield return hardware;
+        foreach (var child in hardware.SubHardware)
+            foreach (var item in Walk(child)) yield return item;
+    }
+
+    public static void Log(Exception error) => LogEvent(error.ToString());
+
+    static void LogEvent(string message)
+    {
+        try
+        {
+            Directory.CreateDirectory(LocalCalibration.Folder);
+            string file = Path.Combine(LocalCalibration.Folder, "cooling.log");
+            if (new FileInfo(file).Exists && new FileInfo(file).Length > 1_000_000) File.Move(file, file + ".old", true);
+            File.AppendAllText(file, $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}");
+        }
+        catch (IOException error) { Trace.TraceError(error.Message); }
+        catch (UnauthorizedAccessException error) { Trace.TraceError(error.Message); }
+    }
 }
