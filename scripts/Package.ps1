@@ -45,8 +45,12 @@ try {
     $executable = Get-Item -LiteralPath (Join-Path $app 'AirDesk.exe')
     if ($executable.VersionInfo.ProductVersion -ne "$version+$sha") { throw 'Packaged executable has incorrect Git version metadata.' }
 
-    foreach ($item in 'README.md','CHANGELOG.md','LICENSE','THIRD-PARTY-NOTICES.md','docs','licenses') {
-        Copy-Item -LiteralPath (Join-Path $root $item) -Destination $app -Recurse
+    $docs = Invoke-Checked 'git' @('-C', $root, 'ls-files', '--', 'docs', 'licenses')
+    $files = @('README.md','CHANGELOG.md','CONTRIBUTING.md','LICENSE','THIRD-PARTY-NOTICES.md') + @($docs)
+    foreach ($item in $files) {
+        $target = Join-Path $app $item
+        New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $root $item) -Destination $target
     }
 
     $nuget = Get-Content -LiteralPath (Join-Path $root 'src/AirDesk/obj/project.assets.json') -Raw | ConvertFrom-Json

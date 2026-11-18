@@ -21,6 +21,7 @@ public sealed class UserPreferences
     public TrayMetric[] Tooltip { get; set; } = DesktopLayout.DefaultTooltip();
     public HistoryRetention Retention { get; set; }
     public ThresholdRule[] Rules { get; set; } = [];
+    public FrameOverlayOptions Overlay { get; set; } = new();
     static readonly string DefaultPath = Path.Combine(AtomicJson.Folder, "monitor-preferences-v1.json");
     string path = DefaultPath;
     [JsonIgnore] public string? RecoveryNotice { get; private set; }
@@ -72,6 +73,7 @@ public sealed class UserPreferences
             saved.Tooltip = (saved.Tooltip ?? DesktopLayout.DefaultTooltip()).Where(value => Enum.IsDefined(value)).Distinct().ToArray();
             saved.Retention = Enum.IsDefined(saved.Retention) ? saved.Retention : HistoryRetention.Off;
             saved.Rules = (saved.Rules ?? []).Where(rule => rule?.Valid == true).DistinctBy(rule => rule.Id).Take(32).ToArray();
+            saved.Overlay = (saved.Overlay ?? new()).Normalize();
             saved.Profiles.RemoveAll(entry => entry?.Channel == null || entry.Current == null || !Curve.Valid(entry.Current));
             for (int index = 0; index < saved.Profiles.Count; index++)
             {

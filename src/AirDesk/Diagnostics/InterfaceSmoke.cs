@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Text.Json;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -10,9 +11,14 @@ namespace AirDesk;
 
 public sealed partial class Dashboard
 {
-    void CaptureInterface()
+    async Task CaptureInterfaceAsync()
     {
         var results = new System.Collections.Generic.List<object>();
+        if (!IsVisible) throw new InvalidOperationException("Main window did not start.");
+        Close();
+        if (IsVisible || shellDisposed) throw new InvalidOperationException("Close did not hide the window in the notification area.");
+        ActivateFromSecondLaunch();
+        if (!IsVisible) throw new InvalidOperationException("Hidden window could not be reopened.");
         foreach (var (name, appearance, width, dpi, columns) in new[]
         {
             ("dark-100", Appearance.Dark, 1040d, 96, 4),
@@ -43,6 +49,26 @@ public sealed partial class Dashboard
         ToggleFlyout();
         SaveImage(flyout!, "tray", 96);
         flyout?.Hide();
+        string frameFixture = Path.Combine(AppContext.BaseDirectory, "ui-smoke-frames.csv");
+        File.WriteAllText(frameFixture, "ProcessID,SwapChainAddress,msBetweenPresents\n");
+        frames = new FrameCapture(frameFixture, 42);
+        preferences.Overlay = new(true, OverlayCorner.BottomRight, 1, .85, OverlayMetric.Frames | OverlayMetric.FrameTime | OverlayMetric.Cpu);
+        ApplyOverlay();
+        try
+        {
+            for (int i = 0; i < 6 && frames.Current == null; i++)
+            {
+                await Task.Delay(500);
+                File.AppendAllText(frameFixture, "42,A,20\n42,A,20\n");
+            }
+            if (frames.Current is not { FramesPerSecond: 50 } || overlay is not { IsVisible: true, ShowActivated: false })
+                throw new InvalidOperationException("OSD did not display the isolated frame capture.");
+            RenderFrames(force: true);
+            if (overlayText?.Text.Contains("FPS 50", StringComparison.Ordinal) != true)
+                throw new InvalidOperationException("OSD did not render the measured rate.");
+            SaveImage(overlay, "osd", 96);
+        }
+        finally { DisposeFrames(); File.Delete(frameFixture); }
         File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "ui-smoke.json"), JsonSerializer.Serialize(results));
     }
 

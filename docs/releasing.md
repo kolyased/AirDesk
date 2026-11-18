@@ -6,8 +6,9 @@
 
 ```powershell
 dotnet build AirDesk.slnx -c Release
-dotnet run --project tests -c Release
+dotnet test AirDesk.slnx -c Release --logger "trx;LogFileName=airdesk.trx"
 pwsh -File scripts/Package.ps1 -Iscc 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+pwsh -File scripts/Test-Package.ps1
 ```
 
 Без параметра `-Iscc` создаётся Portable ZIP. При сборке обоих пакетов установщик и ZIP используют одну папку публикации, включая локальный .NET, инструкции и лицензии. Скрипт сверяет опубликованные зависимости, версию, Git SHA и отсутствие отдельного драйвера PawnIO. Статус подписей и модификаций рабочей копии указан в `BUILD.txt`. SHA-256 обоих пакетов находится в `AirDesk-<версия>-SHA256.txt`.

@@ -22,7 +22,7 @@ public sealed partial class Dashboard : Window
 {
     const int OverviewTab = 0, CoolingTab = 1, DevicesTab = 2, DiagnosticsTab = 3, SettingsTab = 4, HistoryTab = 5;
     readonly DashboardViewModel viewModel;
-    readonly UserPreferences preferences = UserPreferences.Load();
+    readonly UserPreferences preferences;
     readonly bool autostartSession;
     readonly DriverStatus startupDriver = DriverStatus.Read();
     readonly TabControl tabs = new() { BorderThickness = new(0) };
@@ -48,6 +48,7 @@ public sealed partial class Dashboard : Window
     public Dashboard(bool autostart, bool benchmark = false, bool recordHistory = false, bool monitorOnly = false)
     {
         autostartSession = autostart;
+        preferences = UserPreferences.Load(benchmark ? System.IO.Path.Combine(AppContext.BaseDirectory, "ui-test-preferences.json") : null);
         viewModel = new DashboardViewModel(autostart || monitorOnly,
             benchmark ? System.IO.Path.Combine(AppContext.BaseDirectory, "benchmark-history") : null);
         DataContext = viewModel;
@@ -164,10 +165,16 @@ public sealed partial class Dashboard : Window
             Dispatcher.BeginInvoke(() => { if (!shellDisposed) AppTheme.Apply(preferences.Theme); });
     }
 
-    public void Start(bool smoke, bool uiSmoke, bool benchmark)
+    public void Start(bool smoke, bool uiSmoke, bool benchmark, bool soak)
     {
         viewModel.Start();
         refresh.Start();
+        if (soak)
+        {
+            StartSoak();
+            return;
+        }
+        if (!smoke && preferences.Overlay.Enabled) ApplyOverlay();
         if (!smoke && !benchmark) return;
         var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(benchmark ? 24 : 12) };
         timer.Tick += async (_, _) =>
@@ -176,7 +183,7 @@ public sealed partial class Dashboard : Window
             try
             {
                 System.IO.File.WriteAllText(System.IO.Path.Combine(AppContext.BaseDirectory, benchmark ? "benchmark.json" : "smoke.json"), ReportText());
-                if (uiSmoke) CaptureInterface();
+                if (uiSmoke) await CaptureInterfaceAsync();
             }
             finally { await ExitAsync(); }
         };
@@ -186,6 +193,7 @@ public sealed partial class Dashboard : Window
     void Render()
     {
         latest = viewModel.Latest;
+        RenderFrames();
         if (latest == null)
         {
             if (viewModel.Stalled)
@@ -326,13 +334,15 @@ public sealed partial class Dashboard : Window
     {
         if (shellDisposed) return;
         shellDisposed = true;
+        DisposeFrames();
+        StopSoak();
         updateRequest?.Cancel();
         refresh.Stop(); debounce.Stop();
         SystemEvents.UserPreferenceChanged -= OnSystemPreferenceChanged;
         DisposeTray();
     }
 
-    static string Format(float? value, string unit) => value.HasValue ? $"{value:0.#} {unit}" : "—";
+    static string Format(float? value, string unit) => ReadingDisplay.Value(value, unit);
     static TextBlock Text(string text, double size)
     {
         var label = new TextBlock { Text = text, FontSize = size, Margin = new(0, 0, 0, 5) };

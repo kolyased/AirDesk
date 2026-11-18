@@ -85,6 +85,7 @@ public sealed partial class Dashboard
         AddWrapped(systemTray, "Подсказка Windows вмещает только часть значений. Остальные доступны по щелчку по значку.");
         body.Children.Add(Surface(systemTray, new Thickness(14), new Thickness(0, 0, 0, 12)));
         body.Children.Add(BuildHistorySettings());
+        body.Children.Add(BuildFrameSettings());
         body.Children.Add(BuildUpdates());
         if (preferences.RecoveryNotice is { } notice) AddWrapped(body, notice);
         body.Children.Add(Button("Сбросить настройки…", () => _ = ResetPreferences()));

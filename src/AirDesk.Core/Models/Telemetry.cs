@@ -167,6 +167,7 @@ public sealed class Telemetry
     public TemperatureInput[] CurveSources { get; }
     public Reading[] HistorySources { get; }
     public Reading? Find(SensorReference sensor) => bySensor.GetValueOrDefault(sensor);
+    public DeviceReadings? PrimaryGpu(string? id) => Gpus.FirstOrDefault(device => device.Id == id) ?? Gpus.FirstOrDefault();
 
     public static TimeSpan MaxAge(string deviceType) => deviceType switch
     {

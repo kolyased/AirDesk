@@ -12,6 +12,9 @@ TestResults/
 smoke.json
 benchmark.json
 ui-smoke.json
+ui-test-preferences.json*
+ui-smoke-frames.csv
+soak.jsonl
 benchmark-history/
 /src/AirDesk/dark-*.png
 /src/AirDesk/light-*.png
@@ -19,7 +22,12 @@ benchmark-history/
 /src/AirDesk/settings.png
 /src/AirDesk/history.png
 /src/AirDesk/tray.png
+/src/AirDesk/osd.png
 settings-v*.json*
+monitor-preferences-v*.json*
 history-v*.json*
 fan-binding-v*.json*
 cooling.log*
+frames.csv
+*.dmp
+*.pfx

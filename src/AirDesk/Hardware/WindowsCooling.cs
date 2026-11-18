@@ -21,7 +21,7 @@ internal static class ControllerProcesses
             {
                 using (process)
                 {
-                    try { return ControllerName(process.ProcessName); }
+                    try { return ControllerNames.Match(process.ProcessName); }
                     catch (InvalidOperationException) { return null; } // Process exited during enumeration.
                 }
             }).OfType<string>().Distinct().Order().ToArray();
@@ -34,22 +34,6 @@ internal static class ControllerProcesses
         }
     }
 
-    internal static string? ControllerName(string name)
-    {
-        string key = new(name.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
-        if (key.StartsWith("fancontrol", StringComparison.Ordinal)) return "FanControl";
-        if (key.StartsWith("msiafterburner", StringComparison.Ordinal)) return "MSI Afterburner";
-        if (key.StartsWith("argusmonitor", StringComparison.Ordinal)) return "Argus Monitor";
-        return key switch
-        {
-            "speedfan" => "SpeedFan",
-            "asusfancontrolservice" or "aifanspeed" or "asuscomsvc" => "ASUS Fan Xpert / AI Suite",
-            "gigabytecontrolcenter" or "smartfan" or "svctune" => "GIGABYTE Control Center / Smart Fan",
-            "icue" or "corsairservice" => "Corsair iCUE",
-            "nzxtcam" => "NZXT CAM",
-            _ => null
-        };
-    }
 }
 
 internal sealed class LocalCalibration : ICalibrationStore

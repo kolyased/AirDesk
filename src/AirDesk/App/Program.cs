@@ -14,11 +14,12 @@ public static class Program
     public static void Main(string[] args)
     {
         Forms.Application.SetHighDpiMode(Forms.HighDpiMode.PerMonitorV2);
-        using var legacy = new Mutex(true, @"Local\AirDesk-0.1", out bool first);
-        using var single = new Mutex(true, @"Local\AirDesk", out bool unique);
+        bool soak = args.Contains("--soak");
+        using var legacy = new Mutex(true, soak ? @"Local\AirDesk.Soak.Legacy" : @"Local\AirDesk-0.1", out bool first);
+        using var single = new Mutex(true, soak ? @"Local\AirDesk.Soak" : @"Local\AirDesk", out bool unique);
         if (!first || !unique)
         {
-            if (!args.Contains("--autostart")) ActivateExisting();
+            if (!soak && !args.Contains("--autostart")) ActivateExisting();
             return;
         }
 
@@ -30,9 +31,11 @@ public static class Program
         }
         bool smoke = args.Contains("--smoke") || args.Contains("--ui-smoke");
         bool benchmark = args.Contains("--benchmark");
-        using var signal = new EventWaitHandle(false, EventResetMode.AutoReset, ActivationEvent);
+        using var signal = new EventWaitHandle(false, EventResetMode.AutoReset, soak ? @"Local\AirDesk.Soak.Activate" : ActivationEvent);
         var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
-        var window = new Dashboard(autostart || benchmark, benchmark, args.Contains("--record-history"), args.Contains("--monitor-only"));
+        bool fixture = args.Contains("--ui-smoke");
+        var window = new Dashboard(autostart || benchmark || soak || fixture, benchmark || soak || fixture,
+            args.Contains("--record-history"), args.Contains("--monitor-only"));
         var activation = ThreadPool.RegisterWaitForSingleObject(signal, (_, _) =>
         {
             if (!app.Dispatcher.HasShutdownStarted) app.Dispatcher.BeginInvoke(window.ActivateFromSecondLaunch);
@@ -46,8 +49,8 @@ public static class Program
         };
         app.SessionEnding += (_, _) => window.EndSession();
         app.Exit += (_, _) => window.DisposeShell();
-        if (smoke || !args.Contains("--tray") && (benchmark || !window.StartMinimized)) window.Show();
-        window.Start(smoke, args.Contains("--ui-smoke"), benchmark);
+        if (!soak && (smoke || !args.Contains("--tray") && (benchmark || !window.StartMinimized))) window.Show();
+        window.Start(smoke, fixture, benchmark, soak);
         try { app.Run(); }
         finally { activation.Unregister(null); }
     }

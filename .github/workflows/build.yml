@@ -1,18 +1,62 @@
 name: Windows build
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
-  build:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet test tests -c Release --logger "trx;LogFileName=airdesk.trx" --results-directory TestResults
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AirDesk-test-results
+          path: TestResults/*.trx
+  analysis:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-      - run: dotnet build AirDesk.slnx -c Release
-      - run: dotnet run --project tests -c Release
+      - run: dotnet build AirDesk.slnx -c Release -p:RunAnalyzersDuringBuild=true -warnaserror
+  desktop:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet publish src/AirDesk -c Release -r win-x64 --self-contained true -o dist/ui
+      - shell: pwsh
+        run: ./scripts/Test-Desktop.ps1 -Executable dist/ui/AirDesk.exe -ExpectNoPawnIO
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AirDesk-WPF-smoke
+          path: |
+            dist/ui/*.png
+            dist/ui/smoke.json
+            dist/ui/ui-smoke.json
+            dist/ui/benchmark.json
+  publish:
+    needs: [unit, analysis, desktop]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
       - name: Build portable package
         shell: pwsh
         run: ./scripts/Package.ps1
+      - name: Check package contents and SHA-256
+        shell: pwsh
+        run: ./scripts/Test-Package.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: AirDesk-portable-win-x64

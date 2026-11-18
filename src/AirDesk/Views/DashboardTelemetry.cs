@@ -87,7 +87,7 @@ public sealed partial class Dashboard
 
     void RenderTelemetry(Telemetry data, bool stale, bool newData)
     {
-        var gpu = data.Gpus.FirstOrDefault(item => item.Id == preferences.Gpu) ?? data.Gpus.FirstOrDefault();
+        var gpu = data.PrimaryGpu(preferences.Gpu);
         float? Read(Reading? reading) => !stale && reading?.Available == true ? reading.Value : null;
         float? load = Read(data.Cpu?.Load);
         viewModel.Cpu.Set(Format(load, "%"), ValueStatus(data.Cpu?.Temperature, stale, "°C"));

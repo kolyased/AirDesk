@@ -2,13 +2,15 @@ using System;
 using System.IO;
 using System.Text.Json;
 using AirDesk;
+using Xunit;
 
-internal static class ReleasePackageTests
+public sealed class ReleasePackageTests
 {
     const string Digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
     const string Asset = "https://github.com/kolyased/AirDesk/releases/download/v0.7.0/AirDesk-0.7.0-Setup-win-x64.exe";
 
-    public static int Run()
+    [Fact]
+    public void StableReleaseMustBeNewerAndMatchBytes()
     {
         var installed = new Version(0, 6, 0, 0);
         using var valid = JsonDocument.Parse(Build(Digest, Asset));
@@ -21,17 +23,34 @@ internal static class ReleasePackageTests
         Verify(!release.Matches(1024, changed), "rejects differing digest");
         Verify(ReleasePackage.Parse(valid.RootElement, new Version(0, 7, 0, 0)) == null, "ignores installed version");
         Verify(ReleasePackage.Parse(valid.RootElement, new Version(1, 0, 0)) == null, "rejects implicit downgrade");
+    }
+
+    [Fact]
+    public void PreviewsAndDraftReleasesAreIgnored()
+    {
+        var installed = new Version(0, 6, 0, 0);
+        using var valid = JsonDocument.Parse(Build(Digest, Asset));
         using var prerelease = JsonDocument.Parse(Build(Digest, Asset, prerelease: true));
         Verify(ReleasePackage.Parse(prerelease.RootElement, installed) == null, "ignores prereleases");
         using var draft = JsonDocument.Parse(Build(Digest, Asset, draft: true));
         Verify(ReleasePackage.Parse(draft.RootElement, installed) == null, "ignores drafts");
+    }
+
+    [Fact]
+    public void PackageOriginSizeAndDigestMustMatch()
+    {
+        var installed = new Version(0, 6, 0, 0);
         Verify(Rejected(Build("sha256:xyz", Asset), installed), "requires a complete digest");
         Verify(Rejected(Build(Digest, "https://example.org/setup.exe"), installed), "rejects arbitrary locations");
         Verify(Rejected(Build(Digest, Asset, size: ReleasePackage.MaxPackageBytes + 1), installed), "bounds downloads");
+    }
+
+    [Fact]
+    public void RedirectsRequireTrustedHttpsHost()
+    {
         Verify(ReleasePackage.AllowsRedirect(new Uri("https://release-assets.githubusercontent.com/path")), "permits GitHub release CDN");
         Verify(!ReleasePackage.AllowsRedirect(new Uri("https://release-assets.githubusercontent.com.example.org/setup")), "rejects misleading hosts");
         Verify(!ReleasePackage.AllowsRedirect(new Uri("http://release-assets.githubusercontent.com/path")), "requires TLS");
-        return 14;
     }
 
     static string Build(string digest, string url, long size = 1024, bool prerelease = false, bool draft = false) =>
@@ -50,6 +69,6 @@ internal static class ReleasePackageTests
 
     static void Verify(bool result, string check)
     {
-        if (!result) throw new InvalidOperationException("Release package: " + check);
+        Assert.True(result, check);
     }
 }

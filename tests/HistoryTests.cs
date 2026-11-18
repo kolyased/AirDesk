@@ -1,18 +1,19 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using AirDesk;
+using Xunit;
 
-static class HistoryTests
+public sealed class HistoryTests
 {
-    public static int Run()
+    static void Check(bool result, string name) => Assert.True(result, name);
+
+    [Fact]
+    public void AggregationKeepsTimestampsExtremaAndRetention()
     {
-        int checks = 0;
-        void Check(bool result, string name) { if (!result) throw new InvalidOperationException(name); checks++; }
         var now = DateTimeOffset.Parse("2026-11-18T15:40:00Z");
         var key = new SensorReference("/gpu-nvidia/0/temperature/0", "/gpu-nvidia/0", "Example GPU");
-        Reading ReadingAt(DateTimeOffset at, float value, ReadingQuality quality = ReadingQuality.Fresh) => new(key.DeviceName,
-            key.DeviceId, "GpuNvidia", "GPU Core", "Temperature", "°C", value, key.Id, quality, at);
         HistoryPoint Point(DateTimeOffset time, float value) => new(key, "GPU Core", "°C", time, time, value, value, value, 1, 10);
         var old = now.AddHours(-2);
         var raw = new[] { Point(old, 35), Point(old.AddSeconds(10), 45), Point(old.AddSeconds(120), 60), Point(now, 40) };
@@ -23,7 +24,15 @@ static class HistoryTests
         Check(HistoryModel.Compact(raw, now, HistoryRetention.Hour).Single().At == now, "Expired points rotate out");
         var many = Enumerable.Range(0, HistoryModel.MaxPoints + 100).Select(i => Point(now.AddMilliseconds(-i * 10), 40));
         Check(HistoryModel.Compact(many, now, HistoryRetention.Hour).Length == HistoryModel.MaxPoints, "History stays bounded even on short intervals");
+    }
 
+    [Fact]
+    public void ThresholdsRequireRealSamplesHysteresisAndQuietPeriod()
+    {
+        var now = DateTimeOffset.Parse("2026-11-18T15:40:00Z");
+        var key = new SensorReference("/gpu-nvidia/0/temperature/0", "/gpu-nvidia/0", "Example GPU");
+        Reading ReadingAt(DateTimeOffset at, float value, ReadingQuality quality = ReadingQuality.Fresh) => new(key.DeviceName,
+            key.DeviceId, "GpuNvidia", "GPU Core", "Temperature", "°C", value, key.Id, quality, at);
         var rule = new ThresholdRule(Guid.NewGuid(), key, "GPU", ThresholdDirection.Above, 70, 3, 3, 12);
         var evaluator = new ThresholdEvaluator();
         int Observe(int seconds, float value, ReadingQuality quality = ReadingQuality.Fresh) =>
@@ -34,7 +43,14 @@ static class HistoryTests
         Check(Observe(12, 76, ReadingQuality.Stale) == 0 && Observe(15, 76) == 0 && Observe(18, 76) == 1,
             "Missing and stale data break a threshold hold; recovery arms a new observed hold");
         Check(Observe(18, 76) == 0, "Identical cached samples are not counted twice");
+    }
 
+    [Fact]
+    public void SettingsMigrateAndRecoverWithoutOverwritingFutureVersions()
+    {
+        var now = DateTimeOffset.Parse("2026-11-18T15:40:00Z");
+        var key = new SensorReference("/gpu-nvidia/0/temperature/0", "/gpu-nvidia/0", "Example GPU");
+        var rule = new ThresholdRule(Guid.NewGuid(), key, "GPU", ThresholdDirection.Above, 70, 3, 3, 12);
         string directory = Path.Combine(Path.GetTempPath(), "AirDesk-test-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
         try
@@ -54,24 +70,38 @@ static class HistoryTests
                 "Repair keeps the valid backup");
             File.WriteAllText(file, "{\"SchemaVersion\":99}");
             var future = UserPreferences.Load(file, _ => { });
-            try { future.Save(); throw new Exception("Future schema unexpectedly overwritten"); }
-            catch (InvalidOperationException) { checks++; }
+            Assert.Throws<InvalidOperationException>(future.Save);
 
+        }
+        finally { Directory.Delete(directory, recursive: true); }
+    }
+
+    [Fact]
+    public async Task StoreSurvivesRestartAndClearsMemoryAndDisk()
+    {
+        var now = DateTimeOffset.Parse("2026-11-18T15:40:00Z");
+        var key = new SensorReference("/gpu-nvidia/0/temperature/0", "/gpu-nvidia/0", "Example GPU");
+        Reading ReadingAt(DateTimeOffset at, float value, ReadingQuality quality = ReadingQuality.Fresh) => new(key.DeviceName,
+            key.DeviceId, "GpuNvidia", "GPU Core", "Temperature", "°C", value, key.Id, quality, at);
+        string directory = Path.Combine(Path.GetTempPath(), "AirDesk-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
             var history = new HistoryStore(directory);
-            history.ReadAsync().GetAwaiter().GetResult();
+            await history.ReadAsync();
             var sample = DateTimeOffset.UtcNow;
             history.Offer(new Telemetry([ReadingAt(sample, 40)]), sample);
             Check(history.Read().Length == 0, "Disabled history does not collect");
             history.Configure(HistoryRetention.Hour);
             history.Offer(new Telemetry([ReadingAt(sample, 40)]), sample);
             history.Offer(new Telemetry([ReadingAt(sample.AddSeconds(1), 41)]), sample.AddSeconds(1));
-            history.StopAsync().GetAwaiter().GetResult();
+            await history.StopAsync();
             var restarted = new HistoryStore(directory);
-            Check(restarted.ReadAsync().GetAwaiter().GetResult().Single().Mean == 40, "Batched history survives restart and respects sampling interval");
-            restarted.ClearAsync().GetAwaiter().GetResult();
+            Check((await restarted.ReadAsync()).Single().Mean == 40, "Batched history survives restart and respects sampling interval");
+            await restarted.ClearAsync();
             Check(restarted.Read().Length == 0 && !File.Exists(Path.Combine(directory, "history-v1.json")), "Cleanup clears both memory and file");
         }
         finally { Directory.Delete(directory, recursive: true); }
-        return checks;
     }
+
 }
