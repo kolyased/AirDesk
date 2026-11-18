@@ -131,6 +131,7 @@ public sealed class UserPreferences
 
     public void Export(string destination)
     {
+        AtomicJson.RequireExternalDestination(destination);
         string target = Path.GetFullPath(destination);
         if (new[] { path, path + ".bak", path + ".corrupt" }.Any(item => Path.GetFullPath(item).Equals(target, StringComparison.OrdinalIgnoreCase)))
             throw new IOException("Выберите файл экспорта отдельно от файлов настроек.");
@@ -138,6 +139,6 @@ public sealed class UserPreferences
         else AtomicJson.Write(destination, this);
     }
 
-    public static void Reset() => AtomicJson.Write(DefaultPath, new UserPreferences { SchemaVersion = CurrentSchema }, backup: true);
+    public void Reset() => AtomicJson.Write(path, new UserPreferences { SchemaVersion = CurrentSchema }, backup: true);
     public string Label(string key, string original) => Aliases.TryGetValue(key, out string? alias) && !string.IsNullOrWhiteSpace(alias) ? alias : original;
 }

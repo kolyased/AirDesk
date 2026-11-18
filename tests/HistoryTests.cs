@@ -10,6 +10,51 @@ public sealed class HistoryTests
     static void Check(bool result, string name) => Assert.True(result, name);
 
     [Fact]
+    public void ExportProducesCsvAndJsonWithoutOpeningAnInternalFile()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "AirDesk-export-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var time = DateTimeOffset.UtcNow;
+            var row = new HistoryPoint(new("id", "device", "  =1+1"), "CPU \"Package\"", "°C", time, time, 42.5f, 41, 44, 1, 10);
+            string csv = Path.Combine(directory, "history.csv");
+            string json = Path.Combine(directory, "history.json");
+            HistoryExport.Save(csv, [row]);
+            HistoryExport.Save(json, [row]);
+            string data = File.ReadAllText(csv);
+            Assert.Contains("\"'  =1+1\"", data, StringComparison.Ordinal);
+            Assert.Contains("\"CPU \"\"Package\"\"\"", data, StringComparison.Ordinal);
+            Assert.Contains(",42.5,41,44,1", data, StringComparison.Ordinal);
+            using var journal = System.Text.Json.JsonDocument.Parse(File.ReadAllText(json));
+            Assert.Equal(42.5, journal.RootElement.GetProperty("Points")[0].GetProperty("Mean").GetDouble());
+            Assert.Throws<IOException>(() => HistoryExport.Save(Path.Combine(AtomicJson.Folder, "fan-binding-v1.json"), [row]));
+            Assert.Throws<IOException>(() => HistoryExport.Save(Path.Combine(directory, "wrong.txt"), [row]));
+        }
+        finally { Directory.Delete(directory, recursive: true); }
+    }
+
+    [Fact]
+    public async Task UnreadableHistoryCannotBeOverwrittenOrClearedWithoutPreservingOriginal()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "AirDesk-history-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            string path = Path.Combine(directory, "history-v1.json");
+            const string unknown = "{\"Version\":93,\"Points\":[]}";
+            File.WriteAllText(path, unknown);
+            var history = new HistoryStore(directory);
+            history.Configure(HistoryRetention.Hour);
+            await history.ReadAsync();
+            await history.StopAsync();
+            await Assert.ThrowsAsync<InvalidDataException>(history.ClearAsync);
+            Assert.Equal(unknown, File.ReadAllText(path));
+        }
+        finally { Directory.Delete(directory, recursive: true); }
+    }
+
+    [Fact]
     public void AggregationKeepsTimestampsExtremaAndRetention()
     {
         var now = DateTimeOffset.Parse("2026-11-18T15:40:00Z");

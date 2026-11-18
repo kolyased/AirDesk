@@ -253,11 +253,16 @@ public sealed partial class Dashboard
             if (picker.ShowDialog(window) != true) return;
             try
             {
+                AtomicJson.RequireExternalDestination(picker.FileName);
                 if (Path.GetExtension(picker.FileName).Equals(".json", StringComparison.OrdinalIgnoreCase))
                 {
                     using var parsed = JsonDocument.Parse(editor.Text);
                 }
-                File.WriteAllText(picker.FileName, editor.Text);
+                AtomicJson.WriteFile(picker.FileName, stream =>
+                {
+                    using var writer = new StreamWriter(stream, leaveOpen: true);
+                    writer.Write(editor.Text);
+                });
                 window.DialogResult = true;
             }
             catch (JsonException) { MessageBox.Show(window, "Исправьте структуру JSON или выберите текстовый формат .txt.", "Отчёт оборудования"); }

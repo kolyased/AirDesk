@@ -58,16 +58,17 @@ public sealed partial class Dashboard
         if (preferences.Rules.Length != 0) thresholdList.SelectedIndex = 0;
     }
 
-    void SaveRules(ThresholdRule[] rules)
+    bool SaveRules(ThresholdRule[] rules)
     {
         var previous = preferences.Rules;
         preferences.Rules = rules;
-        try { preferences.Save(); viewModel.ConfigureRules(rules); LoadRuleChoices(); }
+        try { preferences.Save(); viewModel.ConfigureRules(rules); LoadRuleChoices(); return true; }
         catch (Exception error)
         {
             preferences.Rules = previous;
             Monitor.Log(error);
             MessageBox.Show(this, "Не удалось сохранить правила: " + error.Message);
+            return false;
         }
     }
 
@@ -109,8 +110,8 @@ public sealed partial class Dashboard
                 (ThresholdDirection)direction.SelectedIndex, boundary, band, sustained, pause);
             if (!rule.Valid || source.Reading.Kind == "Load" && boundary is < 0 or > 100 || source.Reading.Kind == "Fan" && boundary < 0)
             { feedback.Text = "Проверьте диапазон порога. Гистерезис должен быть положительным."; return; }
-            SaveRules(preferences.Rules.Where(item => item.Id != rule.Id).Append(rule).ToArray());
-            window.DialogResult = true;
+            if (SaveRules(preferences.Rules.Where(item => item.Id != rule.Id).Append(rule).ToArray()))
+                window.DialogResult = true;
         }));
         window.ShowDialog();
     }
@@ -145,7 +146,7 @@ public sealed partial class Dashboard
         try
         {
             preferences.Export(save.FileName);
-            UserPreferences.Reset();
+            preferences.Reset();
             MessageBox.Show(this, "Копия сохранена. AirDesk закроется. При следующем запуске загрузятся настройки по умолчанию.");
             await ExitAsync();
         }

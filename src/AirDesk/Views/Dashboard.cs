@@ -239,13 +239,14 @@ public sealed partial class Dashboard : Window
             string detail = $"{access} {snapshot.Cooling.Reason}";
             if (driverAccess.Text != detail) driverAccess.Text = detail;
         }
-        string heading = stale || snapshot.PollIssue != null ? "Сбой датчиков" : state switch
+        string heading = state switch
         {
             ChannelState.Conflict => "Конфликт управления",
-            ChannelState.Controlled => "Управление активно",
-            ChannelState.Unverified or ChannelState.Unavailable => "Требуется настройка",
             ChannelState.Restoring => "Возврат управления",
             ChannelState.Error => "Ошибка управления",
+            _ when stale || snapshot.PollIssue != null => "Сбой датчиков",
+            ChannelState.Controlled => "Управление активно",
+            ChannelState.Unverified or ChannelState.Unavailable => "Требуется настройка",
             _ => "Мониторинг"
         };
         if (statusHeading.Text != heading)
@@ -259,11 +260,13 @@ public sealed partial class Dashboard : Window
             statusHeading.SetResourceReference(TextBlock.ForegroundProperty, warning ? AppTheme.Warning : AppTheme.Accent);
             warningColor = warning;
         }
-        status.Text = stale ? "Показания устарели. Откройте диагностику, чтобы проверить драйвер." :
+        status.Text = state is ChannelState.Conflict or ChannelState.Restoring or ChannelState.Error ? FriendlyStatus(snapshot.Cooling) :
+            stale ? "Показания устарели. Откройте диагностику, чтобы проверить драйвер." :
             snapshot.PollIssue != null ? "Часть показаний недоступна. Сведения об ошибке есть в диагностике." :
             autostartSession && state == ChannelState.MonitorOnly ? "Автозапуск работает в режиме мониторинга. Для настройки охлаждения откройте AirDesk вручную." : FriendlyStatus(snapshot.Cooling);
         string lastPoll = DateTimeOffset.TryParse(snapshot.Cooling.LastPollUtc, out var time) ? time.ToLocalTime().ToString("HH:mm:ss") : "—";
-        statusTime.Text = $"Последний опрос: {lastPoll}\n{snapshot.PollIssue ?? snapshot.Cooling.Reason}";
+        statusTime.Text = $"Последний опрос: {lastPoll}\n{snapshot.Cooling.Reason}" +
+            (snapshot.PollIssue is { } issue ? $"\n{issue}" : "");
         string owner = state == ChannelState.Controlled ? ProfileLabel(selected.Kind) : heading;
         activeSummary.Text = $"{snapshot.Cooling.Group ?? "Разъём охлаждения"} · {owner}\nОбороты: {Format(stale ? null : snapshot.Cooling.Rpm, "об/мин")}";
     }

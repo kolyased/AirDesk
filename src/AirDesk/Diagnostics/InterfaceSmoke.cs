@@ -44,6 +44,9 @@ public sealed partial class Dashboard
         SaveImage(this, "settings", 96);
         Navigate(HistoryTab);
         SaveImage(this, "history", 96);
+        if (viewModel.History.Retention != HistoryRetention.Off && visibleHistory.Length == 0)
+            throw new InvalidOperationException("Recording was enabled, but the history view has no readings.");
+        await VerifyPowerTransitionAsync();
         var work = Forms.Screen.PrimaryScreen!.WorkingArea;
         flyoutAnchor = new System.Drawing.Point(work.Right - 12, work.Bottom);
         ToggleFlyout();
@@ -70,6 +73,31 @@ public sealed partial class Dashboard
         }
         finally { DisposeFrames(); File.Delete(frameFixture); }
         File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "ui-smoke.json"), JsonSerializer.Serialize(results));
+    }
+
+    async Task VerifyPowerTransitionAsync()
+    {
+        viewModel.PowerChanged(true);
+        try
+        {
+            await WaitFor(() => viewModel.Latest is { Cooling.LastPollUtc: null, Telemetry.Readings.Length: 0 });
+            long lastPoll = viewModel.Latest!.Polling.Polls;
+            await Task.Delay(1100);
+            if (viewModel.Latest!.Polling.Polls != lastPoll)
+                throw new InvalidOperationException("Hardware polling continued during the simulated suspend.");
+        }
+        finally { viewModel.PowerChanged(false); }
+        await WaitFor(() => viewModel.Latest is { Cooling.LastPollUtc: not null, Telemetry.Readings.Length: > 0 });
+
+        static async Task WaitFor(Func<bool> condition)
+        {
+            for (int i = 0; i < 30; i++)
+            {
+                if (condition()) return;
+                await Task.Delay(100);
+            }
+            throw new InvalidOperationException("Power transition was not reflected in the monitor snapshot.");
+        }
     }
 
     static void SaveImage(Window window, string name, int dpi)

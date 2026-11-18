@@ -31,7 +31,7 @@ function Wait-App([Diagnostics.Process]$Process) {
 
 $report = Join-Path $folder 'ui-smoke.json'
 $started = (Get-Date).ToUniversalTime()
-$app = Start-Process -FilePath $file.FullName -ArgumentList '--ui-smoke','--monitor-only' -WindowStyle Hidden -PassThru
+$app = Start-Process -FilePath $file.FullName -ArgumentList '--ui-smoke','--monitor-only','--record-history' -WindowStyle Hidden -PassThru
 Wait-App $app
 if (!(Test-Path $report) -or (Get-Item $report).LastWriteTimeUtc -lt $started) { throw 'No current WPF report.' }
 $renderings = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
@@ -46,6 +46,10 @@ if (!$monitoring.WindowVisible -or $monitoring.Cooling.CanEnable -or $monitoring
 }
 if ($ExpectNoPawnIO -and ($monitoring.Driver.Registration -ne 0 -or $monitoring.Driver.Version)) {
     throw 'Diagnostics did not detect the missing driver.'
+}
+$historyPath = Join-Path $folder 'benchmark-history/history-v1.json'
+if (!(Test-Path -LiteralPath $historyPath) -or ((Get-Content -LiteralPath $historyPath -Raw | ConvertFrom-Json).Points.Count -eq 0)) {
+    throw 'The test copy did not persist the recorded history.'
 }
 
 $tray = Start-Process -FilePath $file.FullName -ArgumentList '--benchmark','--tray','--monitor-only' -WindowStyle Hidden -PassThru
@@ -67,4 +71,4 @@ finally {
     if (!$tray.HasExited) { $tray.Kill() }
 }
 
-'PASS: WPF launch, hide/reopen, tray activation, both themes, 100–200% render and passive OSD.'
+'PASS: WPF, tray, history persistence, simulated suspend/resume, both themes, 100–200% render, passive OSD.'

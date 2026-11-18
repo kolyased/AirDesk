@@ -1,10 +1,6 @@
 using System;
 using System.Collections.Generic;
-using System.Globalization;
-using System.IO;
 using System.Linq;
-using System.Text;
-using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -146,30 +142,10 @@ public sealed partial class Dashboard
         if (viewModel.History.OwnsPath(picker.FileName)) { MessageBox.Show(this, "Выберите другой файл для экспорта."); return false; }
         try
         {
-            await Task.Run(() =>
-            {
-                if (System.IO.Path.GetExtension(picker.FileName).Equals(".json", StringComparison.OrdinalIgnoreCase))
-                    AtomicJson.Write(picker.FileName, new { Version = 1, ExportedAt = DateTimeOffset.UtcNow, Points = rows });
-                else
-                {
-                    using var writer = new StreamWriter(picker.FileName, false, new UTF8Encoding(true));
-                    writer.WriteLine("from,at,device,device_id,sensor,sensor_id,unit,mean,min,max,count");
-                    foreach (var item in rows)
-                        writer.WriteLine(string.Join(',', item.From.ToString("O"), item.At.ToString("O"), Csv(item.Sensor.DeviceName),
-                            Csv(item.Sensor.DeviceId), Csv(item.Name), Csv(item.Sensor.Id), Csv(item.Unit),
-                            item.Mean.ToString("R", CultureInfo.InvariantCulture), item.Min.ToString("R", CultureInfo.InvariantCulture),
-                            item.Max.ToString("R", CultureInfo.InvariantCulture), item.Count.ToString(CultureInfo.InvariantCulture)));
-                }
-            });
+            await Task.Run(() => HistoryExport.Save(picker.FileName, rows));
             return true;
         }
         catch (Exception error) { Monitor.Log(error); MessageBox.Show(this, "Не удалось сохранить историю: " + error.Message); return false; }
-    }
-
-    static string Csv(string value)
-    {
-        if (value.TrimStart() is { Length: > 0 } trimmed && trimmed[0] is '=' or '+' or '-' or '@') value = "'" + value;
-        return "\"" + value.Replace("\"", "\"\"") + "\"";
     }
 
     async Task ClearHistory()

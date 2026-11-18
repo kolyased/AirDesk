@@ -22,6 +22,7 @@ internal sealed class HistoryStore
     HistoryRetention retention;
     int revision, savedRevision;
     bool stopped;
+    bool invalidOnLoad;
     volatile string? error;
     public string? Error => error;
     public HistoryRetention Retention { get { lock (gate) return retention; } }
@@ -49,7 +50,7 @@ internal sealed class HistoryStore
                 savedRevision = retention == HistoryRetention.Off ? revision : revision - 1;
             }
         }
-        catch (Exception failure) { Fail(failure); }
+        catch (Exception failure) { invalidOnLoad = true; Fail(failure); }
     }
 
     public void Configure(HistoryRetention value)
@@ -101,6 +102,7 @@ internal sealed class HistoryStore
     public async Task FlushAsync()
     {
         await loading.ConfigureAwait(false);
+        if (invalidOnLoad) return;
         await disk.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -140,6 +142,7 @@ internal sealed class HistoryStore
     public async Task ClearAsync()
     {
         await loading.ConfigureAwait(false);
+        if (invalidOnLoad) throw new InvalidDataException("Исходный файл истории сохранён. Скопируйте или переместите его отдельно после выхода из AirDesk.");
         await disk.WaitAsync().ConfigureAwait(false);
         try
         {
