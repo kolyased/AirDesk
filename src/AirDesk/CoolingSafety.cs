@@ -288,19 +288,30 @@ public sealed class CoolingSafety(ICoolingOutput output, ICalibrationStore store
             Capture(verified!.Identity);
             active = true;
             responsePolicy.Reset();
-            Adjust(next);
+            SetProfile(next);
         }
-        catch (Exception error) { Interrupt(error.Message, false); }
+        catch (Exception error) { Interrupt(error.Message, false); throw; }
+        ApplyRequestedProfile();
     }
 
     public void Adjust(FanProfile next)
     {
         if (!active || restoring) throw new InvalidOperationException("Управление недоступно.");
         ValidateProfile(next);
+        SetProfile(next);
+        ApplyRequestedProfile();
+    }
+
+    void SetProfile(FanProfile next)
+    {
         if (profile != next) responsePolicy.ProfileChanged();
         profile = next;
+    }
+
+    void ApplyRequestedProfile()
+    {
         Tick();
-        if (!active) throw new InvalidOperationException(fault ?? "Применить профиль не удалось.");
+        if (!active || !command.HasValue) throw new InvalidOperationException(conflict ?? fault ?? "Применить профиль не удалось.");
     }
 
     void ValidateProfile(FanProfile next)

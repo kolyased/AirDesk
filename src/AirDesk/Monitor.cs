@@ -122,22 +122,24 @@ public sealed class Monitor
                         }
                         foreach (var hardware in available)
                         {
-                            DateTimeOffset now = DateTimeOffset.UtcNow;
                             try
                             {
                                 adapter.Update(hardware);
+                                DateTimeOffset now = DateTimeOffset.UtcNow;
                                 var quality = hardware.HardwareType == HardwareType.SuperIO && adapter.BoardUpdateBlocked ? ReadingQuality.Stale : ReadingQuality.Fresh;
                                 readings.AddRange(hardware.Sensors.Select(sensor => Reading.From(hardware, sensor, now, quality)));
                             }
                             catch (Exception error)
                             {
                                 Log(error);
-                                readings.AddRange(hardware.Sensors.Select(sensor => Reading.From(hardware, sensor, now,
+                                readings.AddRange(hardware.Sensors.Select(sensor => Reading.From(hardware, sensor, DateTimeOffset.UtcNow,
                                     error is UnauthorizedAccessException ? ReadingQuality.AccessDenied : ReadingQuality.Unresponsive)));
                             }
                         }
                         pollIssue = elapsed.Elapsed - started >= CoolingSafety.Freshness ? "Опрос оборудования превысил допустимое время." : null;
-                        telemetry = new Telemetry(readings.ToArray());
+                        telemetry = new Telemetry(Reading.MergePoll(readings.ToArray(), telemetry.Readings,
+                            available.Select(device => (device.Identifier.ToString(), device.Name)).ToHashSet(),
+                            DateTimeOffset.UtcNow, CoolingSafety.Freshness));
                         if (pollIssue != null) safety.Interrupt(pollIssue, true);
                         // A delayed poll must not revive a test or a stale control session.
                         safety.TickBeforeSample();

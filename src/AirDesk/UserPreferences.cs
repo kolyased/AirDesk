@@ -6,8 +6,6 @@ using System.Text.Json;
 
 namespace AirDesk;
 
-public record SavedProfile(ChannelIdentity Channel, FanProfile Current, FanProfile? Previous);
-
 public sealed class UserPreferences
 {
     public Dictionary<string, string> Aliases { get; init; } = new(StringComparer.Ordinal);
@@ -23,6 +21,14 @@ public sealed class UserPreferences
             var saved = JsonSerializer.Deserialize<UserPreferences>(File.ReadAllText(Pathname));
             if (saved?.Aliases == null || saved.Profiles == null) return new();
             saved.Profiles.RemoveAll(entry => entry?.Current == null || !Curve.Valid(entry.Current));
+            for (int index = 0; index < saved.Profiles.Count; index++)
+            {
+                var entry = saved.Profiles[index];
+                saved.Profiles[index] = entry with
+                {
+                    Previous = ValidOrNull(entry.Previous), Startup = ValidOrNull(entry.Startup), LastConfirmed = ValidOrNull(entry.LastConfirmed)
+                };
+            }
             return saved;
         }
         catch (Exception error) { Monitor.Log(error); return new(); }
@@ -30,13 +36,28 @@ public sealed class UserPreferences
 
     public SavedProfile? Find(ChannelIdentity channel) => Profiles.FirstOrDefault(entry => entry.Channel == channel);
 
-    public void SetProfile(ChannelIdentity channel, FanProfile profile)
+    static FanProfile? ValidOrNull(FanProfile? profile) => profile != null && Curve.Valid(profile) ? profile : null;
+
+    public void SetProfile(ChannelIdentity channel, FanProfile profile, bool confirmed)
     {
         if (!Curve.Valid(profile)) throw new ArgumentException("Некорректный профиль.");
         var old = Find(channel);
-        if (old?.Current == profile) return;
+        var next = old?.Select(profile, confirmed) ?? new SavedProfile(channel, profile, null, LastConfirmed: confirmed ? profile : null);
+        if (old != next) StoreProfile(old, next);
+    }
+
+    public void SetStartupProfile(ChannelIdentity channel, FanProfile profile)
+    {
+        if (!Curve.Valid(profile)) throw new ArgumentException("Некорректный профиль по умолчанию.");
+        var old = Find(channel);
+        StoreProfile(old, (old ?? new SavedProfile(channel, profile, null)) with { Startup = profile });
+    }
+
+    void StoreProfile(SavedProfile? old, SavedProfile next)
+    {
+        var channel = next.Channel;
         Profiles.RemoveAll(entry => entry.Channel == channel);
-        Profiles.Add(new(channel, profile, old?.Current));
+        Profiles.Add(next);
         try { Save(); }
         catch
         {

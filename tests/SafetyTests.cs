@@ -60,7 +60,7 @@ static class SafetyTests
         Reject(() => rig.Safety.Enable(Manual));
         rig.Safety.ConfirmUnchangedTopology();
         rig.Output.BeforeGuard = () => rig.Conflict = "FanControl.Service";
-        rig.Safety.Enable(Manual);
+        Reject(() => rig.Safety.Enable(Manual));
         rig.Safety.Tick();
         Check(rig.Output.Writes.Count == 0 && rig.Output.Restores == 1, "Process appearing immediately before write blocks it");
 
@@ -117,6 +117,18 @@ static class SafetyTests
 
         var points = Curve.DefaultPoints(ProfileKind.Balanced);
         Check(Curve.Interpolate(points, 50) == 52.5f && !Curve.ValidPoints([new(45, 60), new(65, 45)]), "Interpolation and monotonic curve validation");
+        var moved = Curve.ConstrainPoint(points, 1, 100, 0);
+        Check(moved.Celsius > points[0].Celsius && moved.Celsius < points[2].Celsius && moved.Percent == points[0].Percent,
+            "Point dragging cannot cross adjacent coordinates");
+        var preset = new SavedProfile(Id, Manual, null, FanProfile.Default, Manual);
+        var draft = preset.Select(Manual with { Manual = 90 }, confirmed: false);
+        Check(draft.StartupSelection == preset.Startup && draft.LastConfirmed == Manual && draft.Previous == Manual,
+            "Offline profile editing preserves startup and last confirmed settings");
+        var saved = System.Text.Json.JsonSerializer.Deserialize<SavedProfile>(System.Text.Json.JsonSerializer.Serialize(draft));
+        Check(saved != null && saved.StartupSelection.SameSettings(FanProfile.Default) && saved.LastConfirmed!.SameSettings(Manual),
+            "Startup and confirmed profile survive reload");
+        var legacy = System.Text.Json.JsonSerializer.Deserialize<SavedProfile>(System.Text.Json.JsonSerializer.Serialize(new { Channel = Id, Current = Manual }));
+        Check(legacy != null && legacy.StartupSelection.SameSettings(Manual), "Old settings continue to open the previous selection");
         var response = new CurveResponse();
         Check(response.Target(FanProfile.Default, 70, 40, 40, TimeSpan.Zero) == 70, "Curve never drops below floor");
         Check(response.Target(FanProfile.Default, 70, 85, 40, TimeSpan.FromSeconds(.1)) == 100, "CPU emergency bypasses slew");
@@ -127,6 +139,29 @@ static class SafetyTests
         Check(catalog.Gpus[0].Name == "GTX" && catalog.Gpus[1].Temperature == first, "GPUs are indexed by identity");
         var ambiguous = new Telemetry([first, second with { Device = first.Device }]);
         Check(ambiguous.CurveSources.Length == 0, "Ambiguous adapter identity cannot drive the curve");
+        var devices = new HashSet<(string, string)> { (first.DeviceId, first.Device) };
+        var completed = first.UpdatedAt!.Value.AddSeconds(5);
+        var late = Reading.MergePoll([first], [], devices, completed, TimeSpan.FromSeconds(4)).Single();
+        Check(late.Quality == ReadingQuality.Stale && !late.Available && new Telemetry([late]).CurveSources.Single().Celsius == null,
+            "An old sample cannot drive a curve after a slow poll");
+        var denied = Reading.MergePoll([first with { Value = null, UpdatedAt = null, Quality = ReadingQuality.AccessDenied }],
+            [first], devices, completed, TimeSpan.FromSeconds(4)).Single();
+        Check(denied.Quality == ReadingQuality.AccessDenied && denied.UpdatedAt == first.UpdatedAt && !denied.Available,
+            "Lack of access preserves last observed timestamp but never marks it fresh");
+        Check(Reading.MergePoll([], [first], new HashSet<(string, string)>(), completed, TimeSpan.FromSeconds(4)).Length == 0 &&
+            Reading.MergePoll([], [first], devices, completed, TimeSpan.FromSeconds(4)).Single().Quality == ReadingQuality.NoSensor,
+            "Disconnected hardware cannot be offered as a curve source; a missing sensor on connected hardware keeps its status");
+        var endurance = new Reading("SSD", "/nvme/0", "Storage", "Percentage Used", "Level", "%", 107,
+            "/nvme/0/level/102", ReadingQuality.Fresh, completed);
+        var spare = endurance with { Name = "Available Spare", Id = "/nvme/0/level/100", Value = 120 };
+        var disk = new Telemetry([endurance, spare]).Disks.Single();
+        Check(disk.Details().Any(metric => metric.Label == "Использованный ресурс NVMe" && metric.Reading == endurance),
+            "NVMe Percentage Used may legitimately exceed 100");
+        Check(disk.Details().Any(metric => metric.Label == "Доступный резерв NVMe" && metric.Reading is { Available: false, Value: null }),
+            "An out-of-range spare value is excluded from the interpreted metric");
+        var unknown = first with { Name = "Temperature #5", DeviceType = "SuperIO", Quality = ReadingQuality.Unverified };
+        Check(new Telemetry([unknown]).Devices.Single().Details().Single().Section == "Неопознанные входы",
+            "Unknown board inputs are grouped without inferring their physical function");
         return checks;
     }
 

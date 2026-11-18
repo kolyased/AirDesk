@@ -11,6 +11,23 @@ public record TemperatureInput(SensorReference Source, string Label, float? Cels
 public record FanProfile(ProfileKind Kind, float Manual, CurvePoint[] Custom, SensorReference? Primary, SensorReference? Secondary)
 {
     public static FanProfile Default => new(ProfileKind.Balanced, 100, Curve.DefaultPoints(ProfileKind.Balanced), null, null);
+
+    public bool SameSettings(FanProfile? other) => other != null && Kind == other.Kind && Manual == other.Manual &&
+        Primary == other.Primary && Secondary == other.Secondary && Custom.SequenceEqual(other.Custom);
+}
+
+public record SavedProfile(ChannelIdentity Channel, FanProfile Current, FanProfile? Previous,
+    FanProfile? Startup = null, FanProfile? LastConfirmed = null)
+{
+    [System.Text.Json.Serialization.JsonIgnore]
+    public FanProfile StartupSelection => Startup ?? Current;
+
+    public SavedProfile Select(FanProfile profile, bool confirmed) => this with
+    {
+        Current = profile,
+        Previous = Current.SameSettings(profile) ? Previous : Current,
+        LastConfirmed = confirmed ? profile : LastConfirmed
+    };
 }
 
 public static class Curve
@@ -50,6 +67,17 @@ public static class Curve
                 return left.Percent + (right.Percent - left.Percent) * (celsius - left.Celsius) / (right.Celsius - left.Celsius);
         }
         return points[^1].Percent;
+    }
+
+    public static CurvePoint ConstrainPoint(CurvePoint[] points, int index, float celsius, float percent)
+    {
+        var left = index > 0 ? points[index - 1] : null;
+        var right = index < points.Length - 1 ? points[index + 1] : null;
+        float minTemperature = left == null ? 0 : left.Celsius + .1f;
+        float maxTemperature = right == null ? 100 : right.Celsius - .1f;
+        var point = points[index];
+        return new(minTemperature <= maxTemperature ? Math.Clamp(celsius, minTemperature, maxTemperature) : point.Celsius,
+            Math.Clamp(percent, left?.Percent ?? 0, right?.Percent ?? 100));
     }
 
     public static (float? Temperature, string Label) Resolve(FanProfile profile, float? cpu, IReadOnlyCollection<TemperatureInput> inputs)

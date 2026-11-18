@@ -15,10 +15,11 @@ public sealed partial class Dashboard
 {
     readonly ComboBox deviceChoice = new() { Width = 310 }, gpuChoice = new() { Width = 290 };
     readonly DataGrid deviceTable = new(), diagnosticTable = new();
+    readonly DataGridTextColumn deviceSection = new() { Header = "Раздел", Binding = new Binding("Section"), Width = 145 };
     readonly TextBlock detailTitle = Text("", 14), diagnosticStatus = Text("", 12);
     bool previousStale, updatingDeviceChoices;
     record DeviceOption(string Id, string Label) { public override string ToString() => Label; }
-    record ReadingRow(string? Key, string Name, string Value, string Quality, string Time, string Original, string Source);
+    record ReadingRow(string? Key, string Name, string Value, string Quality, string Time, string Original, string Source, string Section = "");
 
     FrameworkElement BuildDevices()
     {
@@ -40,6 +41,7 @@ public sealed partial class Dashboard
             if (displayed != null) RenderTelemetry(displayed, previousStale, false);
         };
         ConfigureReadings(deviceTable, false); panel.Children.Add(deviceTable);
+        deviceTable.Columns.Insert(0, deviceSection);
         return panel;
     }
 
@@ -128,14 +130,22 @@ public sealed partial class Dashboard
         var item = displayed?.Devices.FirstOrDefault(device => device.Id == (deviceChoice.SelectedItem as DeviceOption)?.Id);
         if (item == null) { deviceTable.ItemsSource = null; return; }
         detailTitle.Text = $"{preferences.Label(item.Id, item.Name)}   ·   {item.Id}";
+        deviceSection.Visibility = item.Type is "SuperIO" or "Motherboard" ? Visibility.Visible : Visibility.Collapsed;
         var rows = item.Details().Select(metric => metric.Reading == null
             ? new ReadingRow(null, metric.Label, previousStale ? "—" : Format(metric.Derived, metric.Unit),
-                metric.Derived.HasValue ? previousStale ? "Устарело" : "Расчёт" : "Не поддерживается / нет данных", "—", "—", "LibreHardwareMonitor")
-            : Row(metric.Reading, metric.Label, false)).ToList();
+                metric.Derived.HasValue ? previousStale ? "Устарело" : "Расчёт" : QualityText(metric.Missing), "—", "—", "LibreHardwareMonitor")
+            : Row(metric.Reading, metric.Label, false) with { Section = metric.Section }).ToList();
         if (item.Type == "SuperIO" && latest?.Cooling is { } cooling)
         {
-            rows.Insert(0, new(null, "Управление охлаждением", cooling.State.ToString(), cooling.Reason, "—", cooling.Channel ?? "—", "AirDesk"));
-            rows.Insert(1, new(null, "Датчик кривой", cooling.Source ?? "—", cooling.Group ?? "—", "—", cooling.Channel ?? "—", "AirDesk"));
+            const string controls = "Управление AirDesk";
+            string stamp = DateTimeOffset.TryParse(cooling.LastWriteUtc, out var confirmedAt) ? confirmedAt.ToLocalTime().ToString("HH:mm:ss") : "—";
+            rows.InsertRange(0, [
+                new(null, "Группа", cooling.Group ?? "—", cooling.Reason, "—", cooling.Channel ?? "—", "AirDesk", controls),
+                new(null, "Датчик кривой", cooling.Source ?? "—", cooling.State.ToString(), "—", "—", "AirDesk", controls),
+                new(null, "Один тахометр хаба", Format(previousStale ? null : cooling.Rpm, "об/мин"), cooling.State.ToString(), "—", cooling.Identity?.Tachometer ?? "—", "AirDesk", controls),
+                new(null, "Задано", Format(cooling.Requested, "%"), cooling.State.ToString(), "—", cooling.Channel ?? "—", "AirDesk", controls),
+                new(null, "Отправлено", Format(cooling.Sent, "%"), cooling.Command.HasValue ? "Команда подтверждена" : "—", stamp, cooling.Channel ?? "—", "AirDesk", controls)
+            ]);
         }
         UpdateTable(deviceTable, rows);
     }
@@ -159,9 +169,10 @@ public sealed partial class Dashboard
 
     ReadingRow Row(Reading reading, string label, bool raw)
     {
-        bool old = previousStale && reading.UpdatedAt.HasValue;
-        return new(reading.Id, preferences.Label(reading.Id, label), Format(old && !raw ? null : reading.Value, reading.Unit),
-            old ? "Устарело" : QualityText(reading.Quality), reading.UpdatedAt?.ToLocalTime().ToString("HH:mm:ss") ?? "—",
+        ReadingQuality quality = previousStale && reading.Quality is ReadingQuality.Fresh or ReadingQuality.Unverified ? ReadingQuality.Stale : reading.Quality;
+        bool visible = raw || quality is ReadingQuality.Fresh or ReadingQuality.Unverified;
+        return new(reading.Id, preferences.Label(reading.Id, label), Format(visible ? reading.Value : null, reading.Unit),
+            QualityText(quality), reading.UpdatedAt?.ToLocalTime().ToString("HH:mm:ss") ?? "—",
             reading.Name, raw ? $"{reading.Source} · {reading.Id}" : reading.Source);
     }
 
@@ -200,7 +211,8 @@ public sealed partial class Dashboard
     string ReportText() => JsonSerializer.Serialize(new
     {
         Captured = DateTimeOffset.Now, DataStale = previousStale, Hardware = latest?.Cooling.Identity, Cooling = latest?.Cooling,
-        Readings = displayed?.Readings, PollIssue = latest?.PollIssue
+        Readings = displayed?.Readings.Select(reading => previousStale && reading.Quality is ReadingQuality.Fresh or ReadingQuality.Unverified
+            ? reading with { Quality = ReadingQuality.Stale } : reading), PollIssue = latest?.PollIssue
     }, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
 
     void Export()
@@ -214,7 +226,16 @@ public sealed partial class Dashboard
         {
             var picker = new SaveFileDialog { Filter = "JSON|*.json|Текст|*.txt", FileName = "AirDesk-equipment.json" };
             if (picker.ShowDialog(window) != true) return;
-            try { File.WriteAllText(picker.FileName, editor.Text); window.DialogResult = true; }
+            try
+            {
+                if (Path.GetExtension(picker.FileName).Equals(".json", StringComparison.OrdinalIgnoreCase))
+                {
+                    using var parsed = JsonDocument.Parse(editor.Text);
+                }
+                File.WriteAllText(picker.FileName, editor.Text);
+                window.DialogResult = true;
+            }
+            catch (JsonException) { MessageBox.Show(window, "Исправьте структуру JSON или выберите текстовый формат .txt.", "Отчёт оборудования"); }
             catch (Exception error) { Monitor.Log(error); MessageBox.Show(window, error.Message, "Не удалось сохранить отчёт"); }
         }));
         window.ShowDialog();

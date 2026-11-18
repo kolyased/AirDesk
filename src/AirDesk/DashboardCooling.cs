@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
@@ -21,7 +22,7 @@ public sealed partial class Dashboard
     readonly TextBlock speedLabel = Text("", 14);
     readonly DispatcherTimer debounce = new() { Interval = TimeSpan.FromMilliseconds(230) };
     Button calibrate = null!, saveCalibration = null!, confirm = null!, enable = null!, release = null!, recovery = null!,
-        editCurve = null!, rename = null!, previous = null!;
+        editCurve = null!, rename = null!, previous = null!, startup = null!, lastConfirmed = null!;
     FanProfile selected = FanProfile.Default;
     ChannelIdentity? channel;
     TemperatureInput[] sources = [];
@@ -77,7 +78,18 @@ public sealed partial class Dashboard
             if (channel == null || preferences.Find(channel)?.Previous is not { } prior) return;
             _ = ChangeProfile(prior);
         });
-        profiles.Children.Add(editCurve); profiles.Children.Add(previous); panel.Children.Add(profiles);
+        lastConfirmed = Button("Последний подтверждённый", () =>
+        {
+            if (channel != null && preferences.Find(channel)?.LastConfirmed is { } confirmed) _ = ChangeProfile(confirmed);
+        });
+        startup = Button("Сделать профилем по умолчанию", () =>
+        {
+            if (channel == null) return;
+            try { preferences.SetStartupProfile(channel, selected); requestError.Text = "Профиль по умолчанию сохранён. Следующий сеанс начнётся с мониторинга."; }
+            catch (Exception error) { Monitor.Log(error); requestError.Text = "Не удалось сохранить профиль по умолчанию."; }
+        });
+        foreach (var button in new[] { editCurve, previous, lastConfirmed, startup }) profiles.Children.Add(button);
+        panel.Children.Add(profiles);
         var inputs = new WrapPanel();
         foreach (var element in new FrameworkElement[] { primaryChoice, secondaryChoice })
         {
@@ -123,8 +135,9 @@ public sealed partial class Dashboard
 
     async Task EnableAsync()
     {
+        if (channel is not { } key) return;
         FanProfile requested = selected;
-        await Execute(safety => safety.Enable(requested));
+        if (await Execute(safety => safety.Enable(requested))) SaveSelection(key, requested, confirmed: true);
     }
 
     void QueueSpeed()
@@ -145,16 +158,22 @@ public sealed partial class Dashboard
         if (channel == null || latest?.Cooling is not { } cooling || commandPending || monitor.Stalled ||
             (!cooling.CanEnable && !cooling.CanAdjust)) { SetProfileFields(); return; }
         if (!Curve.Valid(profile)) { requestError.Text = "Недопустимая кривая или повторяющиеся датчики."; SetProfileFields(); return; }
+        var key = channel;
         if (cooling.CanAdjust && !await Execute(safety => safety.Adjust(profile))) { SetProfileFields(); return; }
-        try { preferences.SetProfile(channel, profile); selected = profile; }
+        SaveSelection(key, profile, confirmed: cooling.CanAdjust);
+        SetProfileFields();
+    }
+
+    void SaveSelection(ChannelIdentity key, FanProfile profile, bool confirmed)
+    {
+        try { preferences.SetProfile(key, profile, confirmed); if (channel == key) selected = profile; }
         catch (Exception error)
         {
             Monitor.Log(error);
-            monitor.Release();
-            selected = preferences.Find(channel)?.Current ?? FanProfile.Default;
-            requestError.Text = "Не удалось сохранить профиль. Запрошен возврат BIOS/EC.";
+            if (confirmed) monitor.Release();
+            if (channel == key) selected = preferences.Find(key)?.Current ?? FanProfile.Default;
+            requestError.Text = confirmed ? "Не удалось сохранить профиль. Запрошен возврат BIOS/EC." : "Не удалось сохранить профиль.";
         }
-        SetProfileFields();
     }
 
     record SourceOption(SensorReference? Reference, string Label) { public override string ToString() => Label; }
@@ -185,7 +204,7 @@ public sealed partial class Dashboard
         if (channel != cooling.Identity)
         {
             channel = cooling.Identity;
-            selected = channel == null ? FanProfile.Default : preferences.Find(channel)?.Current ?? FanProfile.Default;
+            selected = channel == null ? FanProfile.Default : preferences.Find(channel)?.StartupSelection ?? FanProfile.Default;
             SetProfileFields();
         }
         banner.Text = cooling.Conflict ?? (stale ? "Управление недоступно. Аппаратный исполнитель не отвечает." : "");
@@ -215,7 +234,10 @@ public sealed partial class Dashboard
         profileChoice.IsEnabled = editCurve.IsEnabled = canEdit;
         primaryChoice.IsEnabled = secondaryChoice.IsEnabled = canEdit && selected.Kind != ProfileKind.Manual;
         speed.IsEnabled = canEdit && selected.Kind == ProfileKind.Manual;
-        previous.IsEnabled = canEdit && channel != null && preferences.Find(channel)?.Previous != null;
+        var saved = channel == null ? null : preferences.Find(channel);
+        previous.IsEnabled = canEdit && saved?.Previous != null;
+        lastConfirmed.IsEnabled = canEdit && saved?.LastConfirmed is { } confirmed && !selected.SameSettings(confirmed);
+        startup.IsEnabled = canEdit && !selected.SameSettings(saved?.Startup);
     }
 
     static void Toggle(Button button, bool visible) { button.IsEnabled = visible; button.Visibility = visible ? Visibility.Visible : Visibility.Collapsed; }
@@ -249,7 +271,7 @@ public sealed partial class Dashboard
     void EditCurve()
     {
         var window = Dialog("Кривая охлаждения", 570, 565, out StackPanel content);
-        AddWrapped(content, $"Температура по горизонтали, скорость по вертикали. Минимум группы {Format(latest?.Cooling.Floor, "%")}; при 85 °C срабатывает 100%.");
+        AddWrapped(content, $"Перетащите точку или измените её числа. Точки задают профиль, линия показывает команду с учётом минимума группы {Format(latest?.Cooling.Floor, "%")} и порога 85 °C.");
         var canvas = new Canvas { Height = 145, Background = Bg, Margin = new(0, 4, 0, 8) };
         content.Children.Add(canvas);
         var points = new StackPanel();
@@ -257,6 +279,12 @@ public sealed partial class Dashboard
         content.Children.Add(scroll);
         var validation = Text("", 12); content.Children.Add(validation);
         var rows = new List<(TextBox Celsius, TextBox Percent)>();
+        int? draggedPoint = null;
+        bool draggingUpdate = false;
+        const double plotLeft = 35, plotTop = 5;
+        double WidthOfPlot() => Math.Max(1, canvas.ActualWidth - 52);
+        double HeightOfPlot() => canvas.Height - 28;
+        Point Plot(float celsius, float percent) => new(plotLeft + celsius * WidthOfPlot() / 100, plotTop + HeightOfPlot() * (1 - percent / 100));
         CurvePoint[]? Read() => rows.All(row => float.TryParse(row.Celsius.Text, out _) && float.TryParse(row.Percent.Text, out _))
             ? rows.Select(row => new CurvePoint(float.Parse(row.Celsius.Text), float.Parse(row.Percent.Text))).ToArray() : null;
         void Preview()
@@ -265,13 +293,20 @@ public sealed partial class Dashboard
             var data = Read();
             if (!Curve.ValidPoints(data)) { validation.Text = "Нужны 2–12 точек, возрастающая температура и неубывающий процент (0–100)."; return; }
             validation.Text = "";
-            double width = Math.Max(1, canvas.ActualWidth - 52), height = canvas.Height - 28;
+            double width = WidthOfPlot(), height = HeightOfPlot();
             var graphPoints = Enumerable.Range(0, 101).Select(t =>
             {
                 float duty = t >= 85 ? 100 : Math.Max(latest?.Cooling.Floor ?? 0, Curve.Interpolate(data!, t));
-                return new Point(35 + t * width / 100, 5 + height * (1 - duty / 100));
+                return Plot(t, duty);
             });
             canvas.Children.Add(new Polyline { Stroke = Accent, StrokeThickness = 2, Points = new PointCollection(graphPoints) });
+            foreach (var point in data!)
+            {
+                Point position = Plot(point.Celsius, point.Percent);
+                var marker = new Ellipse { Width = 9, Height = 9, Fill = Brushes.White, Stroke = Accent };
+                Canvas.SetLeft(marker, position.X - 4.5); Canvas.SetTop(marker, position.Y - 4.5);
+                canvas.Children.Add(marker);
+            }
             foreach (var (label, x, y) in new[] { ("100%", 2.0, 0.0), ("0%", 8.0, height), ("0 °C", 35.0, height + 6), ("100 °C", width - 1, height + 6) })
             { var text = Text(label, 10); Canvas.SetLeft(text, x); Canvas.SetTop(text, y); canvas.Children.Add(text); }
         }
@@ -284,11 +319,35 @@ public sealed partial class Dashboard
             row.Children.Add(temperature); row.Children.Add(Text(" °C     ", 13)); row.Children.Add(percent); row.Children.Add(Text(" %    ", 13));
             row.Children.Add(Button("Удалить", () => { rows.Remove((temperature, percent)); points.Children.Remove(row); Preview(); }));
             rows.Add((temperature, percent)); points.Children.Add(row);
-            temperature.TextChanged += (_, _) => Preview(); percent.TextChanged += (_, _) => Preview();
+            temperature.TextChanged += (_, _) => { if (!draggingUpdate) Preview(); };
+            percent.TextChanged += (_, _) => { if (!draggingUpdate) Preview(); };
         }
         void Populate(CurvePoint[] data) { points.Children.Clear(); rows.Clear(); foreach (var point in data) Add(point); Preview(); }
         Populate(selected.Custom);
         canvas.SizeChanged += (_, _) => Preview();
+        canvas.MouseLeftButtonDown += (_, e) =>
+        {
+            var data = Read();
+            if (!Curve.ValidPoints(data)) return;
+            Point location = e.GetPosition(canvas);
+            int index = Enumerable.Range(0, data!.Length).MinBy(i => (Plot(data[i].Celsius, data[i].Percent) - location).LengthSquared);
+            if ((Plot(data[index].Celsius, data[index].Percent) - location).Length <= 12 && canvas.CaptureMouse())
+            { draggedPoint = index; e.Handled = true; }
+        };
+        canvas.MouseMove += (_, e) =>
+        {
+            if (draggedPoint is not int index || Read() is not { } data) return;
+            Point location = e.GetPosition(canvas);
+            var point = Curve.ConstrainPoint(data, index, MathF.Round((float)((location.X - plotLeft) / WidthOfPlot() * 100), 1),
+                MathF.Round((float)((1 - (location.Y - plotTop) / HeightOfPlot()) * 100), 1));
+            draggingUpdate = true;
+            rows[index].Celsius.Text = point.Celsius.ToString("G", CultureInfo.CurrentCulture);
+            rows[index].Percent.Text = point.Percent.ToString("G", CultureInfo.CurrentCulture);
+            draggingUpdate = false;
+            Preview();
+        };
+        canvas.MouseLeftButtonUp += (_, _) => { draggedPoint = null; if (canvas.IsMouseCaptured) canvas.ReleaseMouseCapture(); };
+        canvas.LostMouseCapture += (_, _) => draggedPoint = null;
         var buttons = new WrapPanel(); content.Children.Add(buttons);
         buttons.Children.Add(Button("Добавить точку", () =>
         {
