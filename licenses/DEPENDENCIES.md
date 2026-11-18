@@ -1,5 +1,7 @@
 # NuGet dependency licenses
 
+This list describes the restored dependency graph, which includes non-Windows targets. The published Windows x64 package generates its actual runtime list in `PUBLISHED-RUNTIME.txt`. Refer to [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) for the shipped libraries, source links and accompanying notices.
+
 - BlackSharp.Core/1.0.7: MPL-2.0 https://licenses.nuget.org/MPL-2.0
 - DiskInfoToolkit/1.1.2: MPL-2.0 https://licenses.nuget.org/MPL-2.0
 - HidSharp/2.6.4: LICENSE.txt https://aka.ms/deprecateLicenseUrl
