@@ -200,6 +200,8 @@ internal sealed class WindowsCooling : IFanController, IDisposable
     public RestoreResult Restore() => WithBus<RestoreResult>(() =>
     {
         if (!softwareAttempted) return new(true, true, "Запись не выполнялась.");
+        // Recheck the same backend and readable register map before asking it to restore.
+        _ = ReadCurrent();
         setControl!(1, null);
         bool verified = ReadCurrent() == original;
         if (verified) softwareAttempted = false;

@@ -62,6 +62,7 @@ internal sealed class DashboardViewModel
 
     public void Start() => executor.Start();
     public void Release() => ReleaseCommand.Execute(null);
+    public void PowerChanged(bool isSuspending) => executor.PowerChanged(isSuspending);
     public Task<string> SaveCalibration() => executor.Submit(safety => safety.SaveCalibration());
     public Task<string> ConfirmTopology() => executor.Submit(safety => safety.ConfirmUnchangedTopology());
     public Task<string> AcknowledgeRecovery() => executor.Submit(safety => safety.AcknowledgeRecovery());

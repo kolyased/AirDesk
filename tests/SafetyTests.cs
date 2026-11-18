@@ -79,6 +79,47 @@ public sealed class SafetyTests
     }
 
     [Fact]
+    public void PowerTransitionRestoresAndRevokesSessionConfirmation()
+    {
+        var rig = Rig.Active();
+        rig.Safety.InvalidateForPowerChange();
+        Assert.Null(rig.Safety.View().LastPollUtc);
+        Assert.Equal(ChannelState.Restoring, rig.Safety.View().State);
+        Reject(() => rig.Safety.Adjust(Manual with { Manual = 100 }));
+        rig.Safety.Tick();
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.Single(rig.Output.Writes);
+        rig.Seed();
+        Assert.Equal(ChannelState.Unverified, rig.Safety.View().State);
+        Reject(() => rig.Safety.Enable(Manual));
+        rig.Safety.ConfirmUnchangedTopology();
+        Assert.True(rig.Safety.View().CanEnable);
+    }
+
+    [Fact]
+    public void PowerTransitionDuringCalibrationDiscardsResult()
+    {
+        var rig = new Rig();
+        rig.Seed();
+        rig.Safety.BeginCalibration(Profile);
+        rig.Safety.InvalidateForPowerChange();
+        Assert.Null(rig.Safety.Deadline);
+        rig.Safety.Tick();
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.False(rig.Safety.View().CanSave);
+    }
+
+    [Fact]
+    public void NonFiniteTachometerCannotSeedCalibration()
+    {
+        var rig = new Rig();
+        for (int i = 0; i < 5; i++) rig.Observe(rpm: float.PositiveInfinity);
+        Assert.Equal(ChannelState.Unavailable, rig.Safety.View().State);
+        Reject(() => rig.Safety.BeginCalibration(Profile));
+        Assert.Empty(rig.Output.Writes);
+    }
+
+    [Fact]
     public void BackendExceptionRestoresAndRetainsTheGroupName()
     {
         var rig = new Rig(Profile);

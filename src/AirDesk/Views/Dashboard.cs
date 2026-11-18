@@ -101,6 +101,7 @@ public sealed partial class Dashboard : Window
         Closing += (_, e) => { if (!quitting) { e.Cancel = true; Hide(); } };
         refresh.Tick += (_, _) => Render();
         SystemEvents.UserPreferenceChanged += OnSystemPreferenceChanged;
+        SystemEvents.PowerModeChanged += OnPowerModeChanged;
     }
 
     FrameworkElement BuildOverview()
@@ -310,6 +311,12 @@ public sealed partial class Dashboard : Window
         finally { DisposeShell(); }
     }
 
+    void OnPowerModeChanged(object sender, PowerModeChangedEventArgs args)
+    {
+        if (args.Mode is PowerModes.Suspend or PowerModes.Resume)
+            viewModel.PowerChanged(args.Mode == PowerModes.Suspend);
+    }
+
     internal async Task ExitAsync(string? reason = null)
     {
         if (quitting) return;
@@ -339,6 +346,7 @@ public sealed partial class Dashboard : Window
         updateRequest?.Cancel();
         refresh.Stop(); debounce.Stop();
         SystemEvents.UserPreferenceChanged -= OnSystemPreferenceChanged;
+        SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         DisposeTray();
     }
 

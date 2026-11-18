@@ -64,7 +64,8 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
 
     bool Fresh => lastPoll is { } time && clock() - time < Freshness;
     bool SafeCpu => Fresh && FanPolicy.ValidTemperature(sample?.Cpu);
-    bool HardwareReady => sample is { Available: true, Identity: not null } && sample.Rpm > 0 && sample.Duty is >= 0 and <= 100 && SafeCpu;
+    bool HardwareReady => sample is { Available: true, Identity: not null, Rpm: float rpm } && float.IsFinite(rpm) &&
+        rpm > 0 && sample.Duty is >= 0 and <= 100 && SafeCpu;
     bool Idle => !closed && !stopRequested() && captured == null && !restoring && conflict == null && !storageFailed && !store.RecoveryPending;
     bool CanCalibrate => Idle && HardwareReady && sample!.Cpu < 75 && baseline.Count >= 3 &&
         baseline.Max() - baseline.Min() <= Math.Max(125, Median(baseline.ToArray()) * .08f);
@@ -88,7 +89,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
         else if (verified != null) (state, reason) = (ChannelState.Verified, "Привязка проверена. Управление остаётся у BIOS/EC до включения.");
         else (state, reason) = (ChannelState.Unverified, "Нужно подтвердить подключение и откалибровать канал.");
         return new(state, reason, lastAction, restoreStatus, conflict, CanCalibrate, CanEnable, active && conflict == null && !restoring,
-            captured != null && !restoring, store.RecoveryPending && captured == null && conflict == null && !closed && sample?.Identity != null,
+            captured != null && !restoring, store.RecoveryPending && captured == null && conflict == null && !closed && !stopRequested() && sample?.Identity != null,
             Idle && candidate != null && candidate.Identity == sample?.Identity,
             verified?.Floor ?? candidate?.Floor, verified?.Group ?? store.Saved?.Group, sample?.Identity?.Control,
             sample?.Rpm, command, sample?.Identity, LastPollUtc?.ToString("O"), LastWriteUtc?.ToString("O"),
@@ -100,7 +101,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     {
         if (sample?.Available != true) return sample?.Reason ?? "Контроллер недоступен.";
         if (!SafeCpu) return "Нет свежего валидного датчика температуры CPU.";
-        if (!(sample.Rpm > 0)) return "Нет рабочего тахометра канала. Запись запрещена.";
+        if (sample.Rpm is not float rpm || !float.IsFinite(rpm) || rpm <= 0) return "Нет рабочего тахометра канала. Запись запрещена.";
         return "Нет достоверного показания выхода управления.";
     }
 
@@ -402,6 +403,18 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     {
         closed = true;
         Stop("выход из приложения");
+    }
+
+    public void InvalidateForPowerChange()
+    {
+        sample = null;
+        lastPoll = null;
+        LastPollUtc = null;
+        baseline.Clear();
+        verified = candidate = null;
+        if (captured != null)
+            SetAction("Изменилось состояние питания Windows. Запрошен возврат BIOS/EC. После пробуждения проверьте привязку заново.");
+        BeginRestore();
     }
 
     public void AcknowledgeRecovery()

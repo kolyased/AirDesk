@@ -1,5 +1,5 @@
 using System;
-using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,12 +12,14 @@ public sealed class Monitor
 {
     readonly bool monitorOnly;
     readonly Func<ISensorProvider>? sensorFactory;
-    readonly ConcurrentQueue<(Action<CoolingSafety> Action, TaskCompletionSource<string> Result)> commands = new();
+    readonly object commandGate = new();
+    readonly Queue<(Action<CoolingSafety> Action, TaskCompletionSource<string> Result)> commands = new();
     readonly AutoResetEvent wake = new(false);
     readonly TaskCompletionSource<CoolingView?> finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
     readonly Stopwatch elapsed = Stopwatch.StartNew();
     long lastProgress, testDeadline;
     int stopping, releaseRequested, watchdogReported;
+    int started, powerChanged, suspended;
     volatile Snapshot? latest;
     public Snapshot? Latest => latest;
     public Monitor(bool monitorOnly = false, Func<ISensorProvider>? sensorFactory = null)
@@ -26,23 +28,29 @@ public sealed class Monitor
         this.sensorFactory = sensorFactory;
     }
     internal Action<Telemetry, DateTimeOffset>? Sampled { get; set; }
-    public bool Stalled => Volatile.Read(ref stopping) == 0 && elapsed.ElapsedTicks - Interlocked.Read(ref lastProgress) >=
+    public bool Stalled => Volatile.Read(ref stopping) == 0 && Volatile.Read(ref suspended) == 0 && elapsed.ElapsedTicks - Interlocked.Read(ref lastProgress) >=
         (long)(Stopwatch.Frequency * CoolingSafety.Freshness.TotalSeconds);
 
     public void Start()
     {
-        new Thread(Run) { Name = "AirDesk hardware executor", IsBackground = true }.Start();
+        if (Interlocked.Exchange(ref started, 1) == 0)
+            new Thread(Run) { Name = "AirDesk hardware executor", IsBackground = true }.Start();
     }
 
     public Task<string> Submit(Action<CoolingSafety> action)
     {
-        if (Volatile.Read(ref stopping) != 0 || finished.Task.IsCompleted || Stalled)
-            return Task.FromResult("Исполнитель недоступен. Проверьте состояние драйвера.");
-        if (commands.Count >= 8) return Task.FromResult("Исполнитель занят. Дождитесь окончания команды.");
-        var result = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-        commands.Enqueue((action, result));
-        wake.Set();
-        return result.Task;
+        lock (commandGate)
+        {
+            if (Volatile.Read(ref stopping) != 0 || Stalled)
+                return Task.FromResult("Исполнитель недоступен. Проверьте состояние драйвера.");
+            if (PowerTransitionPending() || Volatile.Read(ref releaseRequested) != 0)
+                return Task.FromResult("Дождитесь обновления показаний и завершения возврата управления.");
+            if (commands.Count >= 8) return Task.FromResult("Исполнитель занят. Дождитесь окончания команды.");
+            var result = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            commands.Enqueue((action, result));
+            wake.Set();
+            return result.Task;
+        }
     }
 
     public void Release()
@@ -50,6 +58,19 @@ public sealed class Monitor
         Interlocked.Exchange(ref releaseRequested, 1);
         wake.Set();
     }
+
+    public void PowerChanged(bool isSuspending)
+    {
+        lock (commandGate)
+        {
+            Volatile.Write(ref powerChanged, 1);
+            Volatile.Write(ref suspended, isSuspending ? 1 : 0);
+            CancelQueued();
+            wake.Set();
+        }
+    }
+
+    bool PowerTransitionPending() => Volatile.Read(ref suspended) != 0 || Volatile.Read(ref powerChanged) != 0;
 
     public async Task<CoolingView?> ShutdownAsync()
     {
@@ -67,7 +88,7 @@ public sealed class Monitor
         PollDiagnostics polling = PollDiagnostics.Empty;
         var interval = TimeSpan.FromMilliseconds(850);
         string? pollIssue = null;
-        bool StopPending() => Volatile.Read(ref stopping) != 0 || Volatile.Read(ref releaseRequested) != 0;
+        bool StopPending() => Volatile.Read(ref stopping) != 0 || Volatile.Read(ref releaseRequested) != 0 || PowerTransitionPending();
         try
         {
             adapter = new WindowsCooling();
@@ -91,9 +112,15 @@ public sealed class Monitor
                 Interlocked.Exchange(ref lastProgress, elapsed.ElapsedTicks);
                 Interlocked.Exchange(ref watchdogReported, 0);
                 if (Volatile.Read(ref stopping) != 0) safety.Close();
-                if (Interlocked.Exchange(ref releaseRequested, 0) != 0)
+                if (Interlocked.Exchange(ref powerChanged, 0) != 0)
                 {
-                    CancelQueued();
+                    safety.InvalidateForPowerChange();
+                    telemetry = Telemetry.Empty;
+                    pollIssue = "Показания будут обновлены после пробуждения Windows.";
+                    nextPoll = nextTick = elapsed.Elapsed;
+                }
+                if (ConsumeReleaseRequest())
+                {
                     safety.Stop("пользователь вернул управление BIOS/EC");
                     nextTick = TimeSpan.Zero;
                 }
@@ -106,14 +133,14 @@ public sealed class Monitor
                 Publish();
                 if (safety.ShutdownComplete) break;
 
-                if (Volatile.Read(ref stopping) == 0 && commands.TryDequeue(out var command))
+                if (!StopPending() && TryTakeCommand(out var command))
                 {
                     try { command.Action(safety); command.Result.TrySetResult(""); }
                     catch (Exception error) { Log(error); command.Result.TrySetResult(error.Message); }
                     Publish();
                 }
 
-                if (Volatile.Read(ref stopping) == 0 && elapsed.Elapsed >= nextPoll && safety.View().State != ChannelState.Restoring)
+                if (!StopPending() && elapsed.Elapsed >= nextPoll && safety.View().State != ChannelState.Restoring)
                 {
                     TimeSpan started = elapsed.Elapsed;
                     try
@@ -121,18 +148,25 @@ public sealed class Monitor
                         bool discover = adapter.RetryDiscovery && started >= nextDiscovery && !safety.OwnsOutput;
                         if (discover) nextDiscovery = started + TimeSpan.FromSeconds(5);
                         SensorPoll samples = provider.Poll(started, discover);
+                        if (PowerTransitionPending()) continue; // This poll may have started before suspend.
                         var duration = elapsed.Elapsed - started;
                         long missed = polling.Polls == 0 ? 0 : (long)((elapsed.Elapsed - nextPoll).TotalMilliseconds / interval.TotalMilliseconds);
                         polling = polling.Observe(duration, missed, samples);
                         bool tooSlow = duration >= CoolingSafety.Freshness;
                         pollIssue = tooSlow ? "Опрос оборудования превысил допустимое время." :
                             samples.FailedDevices > 0 ? $"Недоступны показания устройств: {samples.FailedDevices}." : null;
-                        telemetry = samples.Telemetry;
-                        if (tooSlow) safety.Interrupt(pollIssue!, true);
-                        // A delayed poll must not revive a test or a stale control session.
                         safety.TickBeforeSample();
-                        safety.Observe(monitorOnly ? new FanSample(null, null, null, null, false,
-                            "В этом сеансе доступен только мониторинг.") : adapter.Sample(telemetry));
+                        if (tooSlow)
+                        {
+                            telemetry = Telemetry.Empty;
+                            if (safety.OwnsOutput) safety.Interrupt(pollIssue!, true);
+                        }
+                        else
+                        {
+                            telemetry = samples.Telemetry;
+                            safety.Observe(monitorOnly ? new FanSample(null, null, null, null, false,
+                                "В этом сеансе доступен только мониторинг.") : adapter.Sample(telemetry));
+                        }
                         safety.Tick();
                         if (!tooSlow)
                         {
@@ -144,7 +178,7 @@ public sealed class Monitor
                     {
                         Log(error);
                         pollIssue = "Сбой опроса: " + error.Message;
-                        safety.Interrupt(pollIssue, true);
+                        if (safety.OwnsOutput) safety.Interrupt(pollIssue, true);
                         safety.Tick();
                     }
                     var next = nextPoll + interval;
@@ -182,11 +216,15 @@ public sealed class Monitor
         }
         finally
         {
-            Interlocked.Exchange(ref stopping, 1);
-            CancelQueued();
+            lock (commandGate)
+            {
+                Interlocked.Exchange(ref stopping, 1);
+                CancelQueued();
+            }
             try { provider?.Dispose(); }
             catch (Exception error) { Log(error); }
-            finally { adapter?.Dispose(); }
+            try { adapter?.Dispose(); }
+            catch (Exception error) { Log(error); }
             finished.TrySetResult(safety?.View());
         }
     }
@@ -194,6 +232,26 @@ public sealed class Monitor
     void CancelQueued()
     {
         while (commands.TryDequeue(out var item)) item.Result.TrySetResult("Команда отменена.");
+    }
+
+    bool ConsumeReleaseRequest()
+    {
+        lock (commandGate)
+        {
+            if (Interlocked.Exchange(ref releaseRequested, 0) == 0) return false;
+            CancelQueued();
+            return true;
+        }
+    }
+
+    bool TryTakeCommand(out (Action<CoolingSafety> Action, TaskCompletionSource<string> Result) command)
+    {
+        lock (commandGate)
+        {
+            command = default;
+            return !PowerTransitionPending() && Volatile.Read(ref releaseRequested) == 0 &&
+                Volatile.Read(ref stopping) == 0 && commands.TryDequeue(out command);
+        }
     }
 
     public static void Log(Exception error) => DiagnosticLog.Write(error.ToString());
