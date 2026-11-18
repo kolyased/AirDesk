@@ -53,6 +53,10 @@ try {
     Start-Sleep -Seconds 4
     $tray.Refresh()
     if ($tray.HasExited -or $tray.MainWindowHandle -ne [IntPtr]::Zero) { throw 'The tray instance started with a visible window.' }
+    $soak = Start-Process -FilePath $file.FullName -ArgumentList '--soak' -WindowStyle Hidden -PassThru
+    Wait-App $soak
+    $tray.Refresh()
+    if ($tray.HasExited -or $tray.MainWindowHandle -ne [IntPtr]::Zero) { throw 'The soak command disturbed the active tray instance.' }
     $second = Start-Process -FilePath $file.FullName -ArgumentList '--monitor-only' -WindowStyle Hidden -PassThru
     Wait-App $second
     Wait-App $tray

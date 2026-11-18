@@ -15,8 +15,8 @@ public static class Program
     {
         Forms.Application.SetHighDpiMode(Forms.HighDpiMode.PerMonitorV2);
         bool soak = args.Contains("--soak");
-        using var legacy = new Mutex(true, soak ? @"Local\AirDesk.Soak.Legacy" : @"Local\AirDesk-0.1", out bool first);
-        using var single = new Mutex(true, soak ? @"Local\AirDesk.Soak" : @"Local\AirDesk", out bool unique);
+        using var legacy = new Mutex(true, @"Local\AirDesk-0.1", out bool first);
+        using var single = new Mutex(true, @"Local\AirDesk", out bool unique);
         if (!first || !unique)
         {
             if (!soak && !args.Contains("--autostart")) ActivateExisting();
@@ -31,7 +31,7 @@ public static class Program
         }
         bool smoke = args.Contains("--smoke") || args.Contains("--ui-smoke");
         bool benchmark = args.Contains("--benchmark");
-        using var signal = new EventWaitHandle(false, EventResetMode.AutoReset, soak ? @"Local\AirDesk.Soak.Activate" : ActivationEvent);
+        using var signal = new EventWaitHandle(false, EventResetMode.AutoReset, ActivationEvent);
         var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
         bool fixture = args.Contains("--ui-smoke");
         var window = new Dashboard(autostart || benchmark || soak || fixture, benchmark || soak || fixture,
