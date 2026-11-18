@@ -88,19 +88,19 @@ public sealed partial class Dashboard
     {
         var gpu = data.Gpus.FirstOrDefault(item => item.Id == preferences.Gpu) ?? data.Gpus.FirstOrDefault();
         float? Read(Reading? reading) => !stale && reading?.Available == true ? reading.Value : null;
-        float? load = Read(data.Cpu?.Load), cpuTemperature = Read(data.Cpu?.Temperature), gpuTemperature = Read(gpu?.Temperature);
-        cpuValue.Text = Format(load, "%"); cpuSub.Text = ValueStatus(data.Cpu?.Temperature, stale, "°C");
-        gpuValue.Text = Format(Read(gpu?.Load), "%");
-        gpuSub.Text = ValueStatus(gpu?.Temperature, stale, "°C") + (gpu == null ? "" : " · " + preferences.Label(gpu.Id, gpu.Name));
-        ramValue.Text = Format(Read(data.Ram?.Load), "%");
-        ramSub.Text = Read(data.Ram?.MemoryUsed) is float used && data.Ram?.MemoryTotal is float total ? $"{used:0.#} / {total:0.#} ГБ" : "Физическая память";
+        float? load = Read(data.Cpu?.Load);
+        viewModel.Cpu.Set(Format(load, "%"), ValueStatus(data.Cpu?.Temperature, stale, "°C"));
+        viewModel.Gpu.Set(Format(Read(gpu?.Load), "%"), ValueStatus(gpu?.Temperature, stale, "°C") +
+            (gpu == null ? "" : " · " + preferences.Label(gpu.Id, gpu.Name)));
+        viewModel.Memory.Set(Format(Read(data.Ram?.Load), "%"), Read(data.Ram?.MemoryUsed) is float used && data.Ram?.MemoryTotal is float total
+            ? $"{used:0.#} / {total:0.#} ГБ" : "Физическая память");
         var hottestDisk = data.Disks.Where(disk => Read(disk.Temperature).HasValue).MaxBy(disk => Read(disk.Temperature));
-        diskValue.Text = Format(data.Disks.Select(disk => Read(disk.Load)).DefaultIfEmpty().Max(), "%");
-        diskSub.Text = hottestDisk == null ? "Макс. активность · °C недоступна" : $"{Format(Read(hottestDisk.Temperature), "°C")} · {preferences.Label(hottestDisk.Id, hottestDisk.Name)}";
-        if (newData && load.HasValue)
+        viewModel.Storage.Set(Format(data.Disks.Select(disk => Read(disk.Load)).DefaultIfEmpty().Max(), "%"), hottestDisk == null
+            ? "Макс. активность · °C недоступна" : $"{Format(Read(hottestDisk.Temperature), "°C")} · {preferences.Label(hottestDisk.Id, hottestDisk.Name)}");
+        if (newData)
         {
             DateTimeOffset time = data.Cpu?.Load?.UpdatedAt ?? DateTimeOffset.Now;
-            history.Enqueue((time, load.Value));
+            history.Enqueue((time, load));
         }
         while (history.TryPeek(out var first) && DateTimeOffset.Now - first.Time > TimeSpan.FromSeconds(60)) history.Dequeue();
         DrawGraph();
@@ -177,6 +177,9 @@ public sealed partial class Dashboard
             ? $"{id.BoardVendor} {id.Board} {id.Revision} · BIOS {id.Firmware} · {id.Driver} · LHM {id.Library} · определение {id.Definition}\n{id.Chip} · {id.Control} ↔ {id.Tachometer} · CPU {id.Temperature}"
             : cooling?.Reason ?? "Оборудование ещё не опрошено.";
         if (previousStale) diagnosticStatus.Text += "\nПоследний снимок устарел.";
+        if (latest?.Polling is { } stats)
+            diagnosticStatus.Text += $"\nОпрос {stats.LastMilliseconds:0.#} мс, среднее {stats.AverageMilliseconds:0.#}, пик {stats.PeakMilliseconds:0.#}. Циклы {stats.Polls}; пропущено {stats.MissedCycles}." +
+                $" Устройств обновлено {stats.UpdatedDevices}, отложено {stats.DeferredDevices}, с ошибкой {stats.FailedDevices}.";
         UpdateTable(diagnosticTable, displayed?.Readings.Select(reading => Row(reading, $"{reading.Device} · {reading.Name}", true)).ToArray() ?? []);
     }
 
@@ -230,8 +233,8 @@ public sealed partial class Dashboard
 
     string ReportText() => JsonSerializer.Serialize(new
     {
-        Captured = DateTimeOffset.Now, DataStale = previousStale, Hardware = latest?.Cooling.Identity, Cooling = latest?.Cooling,
-        Readings = displayed?.Readings.Select(reading => previousStale && reading.Quality is ReadingQuality.Fresh or ReadingQuality.Unverified
+        Captured = DateTimeOffset.Now, WindowVisible = IsVisible, DataStale = previousStale, Hardware = latest?.Cooling.Identity, Cooling = latest?.Cooling,
+        Polling = latest?.Polling, Readings = displayed?.Readings.Select(reading => previousStale && reading.Quality is ReadingQuality.Fresh or ReadingQuality.Unverified
             ? reading with { Quality = ReadingQuality.Stale } : reading), PollIssue = latest?.PollIssue
     }, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
 

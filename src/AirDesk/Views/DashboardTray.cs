@@ -32,8 +32,8 @@ public sealed partial class Dashboard
         trayMenu = new Forms.ContextMenuStrip();
         trayMenu.Items.Add("Открыть AirDesk", null, (_, _) => Dispatcher.BeginInvoke(ShowMain));
         trayMenu.Items.Add("Диагностика", null, (_, _) => Dispatcher.BeginInvoke(() => ShowPage(DiagnosticsTab)));
-        var restore = trayMenu.Items.Add("Вернуть управление BIOS/EC", null, (_, _) => monitor.Release());
-        trayMenu.Opening += (_, _) => restore.Enabled = latest?.Cooling.CanRelease == true || monitor.Stalled;
+        var restore = trayMenu.Items.Add("Вернуть управление BIOS/EC", null, (_, _) => viewModel.Release());
+        trayMenu.Opening += (_, _) => restore.Enabled = latest?.Cooling.CanRelease == true || viewModel.Stalled;
         trayMenu.Items.Add("Выход", null, (_, _) => Dispatcher.BeginInvoke(() => _ = ExitAsync()));
 
         trayClick.Interval = TimeSpan.FromMilliseconds(Forms.SystemInformation.DoubleClickTime);
@@ -117,7 +117,7 @@ public sealed partial class Dashboard
         return window;
     }
 
-    bool CanSwitchTrayProfile() => !autostartSession && !previousStale && !commandPending && !monitor.Stalled &&
+    bool CanSwitchTrayProfile() => !autostartSession && !previousStale && !commandPending && !viewModel.Stalled &&
         latest?.Cooling is { State: ChannelState.Controlled, CanAdjust: true, Conflict: null };
 
     void SwitchTrayProfile(ProfileKind kind)

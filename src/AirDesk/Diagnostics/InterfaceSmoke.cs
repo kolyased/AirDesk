@@ -36,6 +36,8 @@ public sealed partial class Dashboard
         SaveImage(this, "cooling", 96);
         Navigate(SettingsTab);
         SaveImage(this, "settings", 96);
+        Navigate(HistoryTab);
+        SaveImage(this, "history", 96);
         var work = Forms.Screen.PrimaryScreen!.WorkingArea;
         flyoutAnchor = new System.Drawing.Point(work.Right - 12, work.Bottom);
         ToggleFlyout();

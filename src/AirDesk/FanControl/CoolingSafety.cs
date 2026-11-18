@@ -17,7 +17,7 @@ public record CoolingView(ChannelState State, string Reason, string Action, stri
     float? Floor, string? Group, string? Channel, float? Rpm, float? Command, ChannelIdentity? Identity, string? LastPollUtc, string? LastWriteUtc,
     bool CanConfirm, float? Requested, float? Sent, string? Source, bool CanRename, bool NeedsRecovery);
 
-public interface ICoolingOutput
+public interface IFanController
 {
     void Acquire();
     // The backend calls guard after acquiring the bus, immediately before the software write.
@@ -36,7 +36,7 @@ public interface ICalibrationStore
     void ClearCapture();
 }
 
-public sealed class CoolingSafety(ICoolingOutput output, ICalibrationStore store,
+public sealed class CoolingSafety(IFanController output, ICalibrationStore store,
     Func<string?> conflictScan, Func<TimeSpan> clock, Action<string> log, Func<bool> stopRequested)
 {
     public static readonly TimeSpan Freshness = TimeSpan.FromSeconds(4);

@@ -195,7 +195,7 @@ static class SafetyTests
         }
     }
 
-    sealed class Output : ICoolingOutput
+    sealed class Output : IFanController
     {
         public List<float> Writes { get; } = new();
         public int Restores, RestoreFailures;

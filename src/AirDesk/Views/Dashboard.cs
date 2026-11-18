@@ -8,6 +8,7 @@ using System.Windows.Automation;
 using System.Windows.Automation.Peers;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Shapes;
@@ -17,43 +18,10 @@ using Forms = System.Windows.Forms;
 
 namespace AirDesk;
 
-public static class Program
-{
-    [STAThread]
-    public static void Main(string[] args)
-    {
-        Forms.Application.SetHighDpiMode(Forms.HighDpiMode.PerMonitorV2);
-        using var legacy = new Mutex(true, @"Local\AirDesk-0.1", out bool first);
-        using var single = new Mutex(true, @"Local\AirDesk", out bool unique);
-        if (!first || !unique)
-        {
-            if (!args.Contains("--autostart")) MessageBox.Show("AirDesk уже работает. Откройте значок в трее.");
-            return;
-        }
-
-        bool autostart = args.Contains("--autostart");
-        bool smoke = args.Contains("--smoke") || args.Contains("--ui-smoke");
-        var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
-        var window = new Dashboard(autostart);
-        app.MainWindow = window;
-        app.DispatcherUnhandledException += async (_, error) =>
-        {
-            error.Handled = true;
-            Monitor.Log(error.Exception);
-            await window.ExitAsync("Ошибка интерфейса. AirDesk завершает управление.");
-        };
-        app.SessionEnding += (_, _) => window.EndSession();
-        app.Exit += (_, _) => window.DisposeShell();
-        if (smoke || !args.Contains("--tray") && !window.StartMinimized) window.Show();
-        window.Start(smoke, args.Contains("--ui-smoke"));
-        app.Run();
-    }
-}
-
 public sealed partial class Dashboard : Window
 {
-    const int OverviewTab = 0, CoolingTab = 1, DevicesTab = 2, DiagnosticsTab = 3, SettingsTab = 4;
-    readonly Monitor monitor;
+    const int OverviewTab = 0, CoolingTab = 1, DevicesTab = 2, DiagnosticsTab = 3, SettingsTab = 4, HistoryTab = 5;
+    readonly DashboardViewModel viewModel;
     readonly UserPreferences preferences = UserPreferences.Load();
     readonly bool autostartSession;
     readonly TabControl tabs = new() { BorderThickness = new(0) };
@@ -61,8 +29,8 @@ public sealed partial class Dashboard : Window
         statusTime = Text("", 12), setupEquipment = Text("Оборудование опрашивается…", 13), activeSummary = Text("Управление BIOS/EC", 14);
     readonly TextBlock cpuValue = Text("—", 32), ramValue = Text("—", 32), gpuValue = Text("—", 32), diskValue = Text("—", 32);
     readonly TextBlock cpuSub = Text("Процессор", 12), ramSub = Text("Память", 12), gpuSub = Text("Видеокарта", 12), diskSub = Text("Накопители", 12);
-    readonly Queue<(DateTimeOffset Time, double Value)> history = new();
-    readonly Polyline graph = new() { StrokeThickness = 2 };
+    readonly Queue<(DateTimeOffset Time, double? Value)> history = new();
+    readonly System.Windows.Shapes.Path graph = new() { StrokeThickness = 2 };
     readonly Canvas graphCanvas = new() { Margin = new(16, 24, 16, 10), ClipToBounds = true };
     readonly DispatcherTimer refresh = new() { Interval = TimeSpan.FromMilliseconds(250) };
     readonly UniformGrid overviewCards = new() { Columns = 4, Margin = new(0, 0, 0, 14) };
@@ -70,14 +38,20 @@ public sealed partial class Dashboard : Window
     Border welcome = null!;
     Snapshot? latest;
     Telemetry? displayed;
+    Telemetry? renderedTelemetry;
+    bool renderedStale;
     bool quitting, warnedStalled, shellDisposed;
     bool? warningColor;
     public bool StartMinimized => preferences.StartMinimized;
 
-    public Dashboard(bool autostart)
+    public Dashboard(bool autostart, bool benchmark = false, bool recordHistory = false)
     {
         autostartSession = autostart;
-        monitor = new Monitor(monitorOnly: autostart);
+        viewModel = new DashboardViewModel(autostart,
+            benchmark ? System.IO.Path.Combine(AppContext.BaseDirectory, "benchmark-history") : null);
+        DataContext = viewModel;
+        viewModel.ConfigureHistory(benchmark ? recordHistory ? HistoryRetention.Hour : HistoryRetention.Off : preferences.Retention);
+        if (!benchmark) viewModel.ConfigureRules(preferences.Rules);
         AppTheme.Apply(preferences.Theme);
         Title = "AirDesk";
         Width = 1040; Height = 760; MinWidth = 330; MinHeight = 345;
@@ -115,9 +89,10 @@ public sealed partial class Dashboard : Window
         tabs.Items.Add(new TabItem { Header = "_Устройства", Content = BuildDevices() });
         tabs.Items.Add(new TabItem { Header = "_Диагностика", Content = BuildDiagnostics() });
         tabs.Items.Add(new TabItem { Header = "_Настройки", Content = Scroll(BuildSettings()) });
+        tabs.Items.Add(new TabItem { Header = "_История", Content = Scroll(BuildHistory()) });
         PreviewKeyDown += (_, e) =>
         {
-            if (Keyboard.Modifiers != ModifierKeys.Control || e.Key < Key.D1 || e.Key > Key.D5) return;
+            if (Keyboard.Modifiers != ModifierKeys.Control || e.Key < Key.D1 || e.Key > Key.D6) return;
             Navigate(e.Key - Key.D1); e.Handled = true;
         };
         InitializeTray();
@@ -147,6 +122,8 @@ public sealed partial class Dashboard : Window
         cards[OverviewCard.Gpu] = Card("Видеокарта", gpuValue, gpuSub);
         cards[OverviewCard.Memory] = Card("Память", ramValue, ramSub);
         cards[OverviewCard.Storage] = Card("Накопители", diskValue, diskSub);
+        BindMetric(cpuValue, cpuSub, viewModel.Cpu); BindMetric(gpuValue, gpuSub, viewModel.Gpu);
+        BindMetric(ramValue, ramSub, viewModel.Memory); BindMetric(diskValue, diskSub, viewModel.Storage);
         ReorderCards();
         overviewCards.SizeChanged += (_, e) => overviewCards.Columns = DesktopLayout.Columns(e.NewSize.Width);
         body.Children.Add(overviewCards);
@@ -168,6 +145,12 @@ public sealed partial class Dashboard : Window
         return body;
     }
 
+    static void BindMetric(TextBlock value, TextBlock detail, DisplayMetric metric)
+    {
+        value.SetBinding(TextBlock.TextProperty, new Binding(nameof(DisplayMetric.Value)) { Source = metric });
+        detail.SetBinding(TextBlock.TextProperty, new Binding(nameof(DisplayMetric.Detail)) { Source = metric });
+    }
+
     void ReorderCards()
     {
         overviewCards.Children.Clear();
@@ -180,18 +163,18 @@ public sealed partial class Dashboard : Window
             Dispatcher.BeginInvoke(() => { if (!shellDisposed) AppTheme.Apply(preferences.Theme); });
     }
 
-    public void Start(bool smoke, bool uiSmoke)
+    public void Start(bool smoke, bool uiSmoke, bool benchmark)
     {
-        monitor.Start();
+        viewModel.Start();
         refresh.Start();
-        if (!smoke) return;
-        var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(12) };
+        if (!smoke && !benchmark) return;
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(benchmark ? 24 : 12) };
         timer.Tick += async (_, _) =>
         {
             timer.Stop();
             try
             {
-                System.IO.File.WriteAllText(System.IO.Path.Combine(AppContext.BaseDirectory, "smoke.json"), ReportText());
+                System.IO.File.WriteAllText(System.IO.Path.Combine(AppContext.BaseDirectory, benchmark ? "benchmark.json" : "smoke.json"), ReportText());
                 if (uiSmoke) CaptureInterface();
             }
             finally { await ExitAsync(); }
@@ -201,36 +184,40 @@ public sealed partial class Dashboard : Window
 
     void Render()
     {
-        latest = monitor.Latest;
+        latest = viewModel.Latest;
         if (latest == null)
         {
-            if (monitor.Stalled)
+            if (viewModel.Stalled)
             {
                 statusHeading.Text = "Сбой датчиков";
                 status.Text = "Оборудование не отвечает. Откройте диагностику и проверьте доступ к драйверу.";
             }
             return;
         }
-        bool stale = monitor.Stalled || DateTimeOffset.Now - latest.Time >= TimeSpan.FromSeconds(4) ||
+        bool stale = viewModel.Stalled || DateTimeOffset.Now - latest.Time >= TimeSpan.FromSeconds(4) ||
             DateTimeOffset.TryParse(latest.Cooling.LastPollUtc, out var polled) && DateTimeOffset.Now - polled >= TimeSpan.FromSeconds(4);
         if (stale && !warnedStalled && (latest.Cooling.CanRelease || latest.Cooling.State is ChannelState.Controlled or ChannelState.Restoring))
         {
             warnedStalled = true;
-            monitor.Release();
+            viewModel.Release();
             tray.ShowBalloonTip(4500, "AirDesk", "Драйвер не отвечает. Возврат BIOS/EC запрошен, результат пока не подтверждён.", Forms.ToolTipIcon.Warning);
         }
         if (!stale) warnedStalled = false;
-        if (!ReferenceEquals(displayed, latest.Telemetry) || stale != previousStale)
+        displayed = latest.Telemetry;
+        previousStale = stale;
+        if (IsVisible && (!ReferenceEquals(renderedTelemetry, displayed) || stale != renderedStale))
         {
-            bool newData = !ReferenceEquals(displayed, latest.Telemetry);
-            displayed = latest.Telemetry;
-            previousStale = stale;
+            bool newData = !ReferenceEquals(renderedTelemetry, displayed);
+            renderedTelemetry = displayed;
+            renderedStale = stale;
             RenderTelemetry(displayed, stale, newData);
             setupEquipment.Text = $"Найдено: {string.Join(", ", displayed.Devices.Where(device => device.Type != "Memory").Select(device => device.Name).Distinct().Take(6))}.\n{driverStatus}";
         }
         RenderSystem(latest, stale);
-        RenderCooling(latest.Cooling, stale);
+        if (IsVisible) RenderCooling(latest.Cooling, stale);
         RenderTray(latest.Telemetry, latest.Cooling, stale);
+        ShowAlerts(latest);
+        RefreshHistory();
     }
 
     void RenderSystem(Snapshot snapshot, bool stale)
@@ -279,17 +266,31 @@ public sealed partial class Dashboard : Window
     void DrawGraph()
     {
         DateTimeOffset left = DateTimeOffset.Now.AddSeconds(-60);
-        graph.Points = new PointCollection(history.Where(item => item.Time >= left).Select(item =>
-            new Point((item.Time - left).TotalSeconds * graphCanvas.ActualWidth / 60, graphCanvas.ActualHeight * (1 - Math.Clamp(item.Value, 0, 100) / 100))));
+        var shape = new StreamGeometry();
+        using (var line = shape.Open())
+        {
+            DateTimeOffset? last = null;
+            foreach (var item in history)
+            {
+                if (item.Time < left || item.Value == null) { last = null; continue; }
+                var point = new Point((item.Time - left).TotalSeconds * graphCanvas.ActualWidth / 60,
+                    graphCanvas.ActualHeight * (1 - Math.Clamp(item.Value.Value, 0, 100) / 100));
+                if (last == null || item.Time - last > TimeSpan.FromSeconds(2.5)) line.BeginFigure(point, false, false);
+                else line.LineTo(point, true, false);
+                last = item.Time;
+            }
+        }
+        shape.Freeze(); graph.Data = shape;
     }
 
     void Navigate(int index) => tabs.SelectedIndex = index;
-    void ShowMain() { flyout?.Hide(); Show(); WindowState = WindowState.Normal; Activate(); }
+    void ShowMain() { flyout?.Hide(); Show(); WindowState = WindowState.Normal; Activate(); Render(); }
+    internal void ActivateFromSecondLaunch() { if (!quitting) ShowMain(); }
     void ShowPage(int index) { ShowMain(); Navigate(index); }
 
     internal void EndSession()
     {
-        try { monitor.ShutdownAsync().GetAwaiter().GetResult(); }
+        try { viewModel.ShutdownAsync().GetAwaiter().GetResult(); }
         catch (Exception error) { Monitor.Log(error); }
         finally { DisposeShell(); }
     }
@@ -301,7 +302,7 @@ public sealed partial class Dashboard : Window
         string? warning = reason;
         try
         {
-            CoolingView? result = await monitor.ShutdownAsync();
+            CoolingView? result = await viewModel.ShutdownAsync();
             if (result is { NeedsRecovery: true })
                 warning = "Возврат BIOS/EC не подтверждён. Проверьте охлаждение. Подробности в %LOCALAPPDATA%\\AirDesk\\cooling.log.";
         }

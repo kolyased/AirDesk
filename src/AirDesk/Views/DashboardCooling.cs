@@ -47,28 +47,28 @@ public sealed partial class Dashboard
         {
             if (MessageBox.Show(this, "По тесту и осмотру вы подтвердили, какие вентиляторы подключены, и проверили выбранный минимум для всей группы?",
                 "Сохранить привязку", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
-                _ = Execute(safety => safety.SaveCalibration());
+                _ = Execute(viewModel.SaveCalibration);
         });
         confirm = Button("Подтвердить прежнее подключение", () =>
         {
             if (MessageBox.Show(this, "Хаб, порт, PWM/DC и состав вентиляторов совпадают с сохранённой привязкой? При изменениях выполните калибровку заново.",
                 "Проверка подключения", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
-                _ = Execute(safety => safety.ConfirmUnchangedTopology());
+                _ = Execute(viewModel.ConfirmTopology);
         });
         enable = Button("Включить управление", () => _ = EnableAsync());
-        void Restore() { debounce.Stop(); monitor.Release(); requestError.Text = "Запрошен возврат BIOS/EC."; }
+        void Restore() { debounce.Stop(); viewModel.Release(); requestError.Text = "Запрошен возврат BIOS/EC."; }
         release = MenuAction("Вернуть управление BIOS/EC", Restore, "Прекращает регулировку AirDesk или отменяет текущую калибровку.");
         emergencyRelease = Button("Остановить управление", Restore, "Возвращает разъём к контролю BIOS/EC.");
         recovery = Button("Подтвердить проверку BIOS/EC", () =>
         {
             if (MessageBox.Show(this, "Подтвердите, что после перезагрузки вы проверили в BIOS/EC работу вентиляторов и автономный режим.",
                 "Восстановление после сбоя", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes)
-                _ = Execute(safety => safety.AcknowledgeRecovery());
+                _ = Execute(viewModel.AcknowledgeRecovery);
         });
         rename = MenuAction("Переименовать группу…", () =>
         {
             string? name = Prompt("Название группы", latest?.Cooling.Group ?? "", 48);
-            if (name != null) _ = Execute(safety => safety.Rename(name));
+            if (name != null) _ = Execute(() => viewModel.Rename(name));
         }, "Меняет название группы в обзоре, трее и диагностике.");
         var actions = new ContextMenu { Placement = PlacementMode.Bottom };
         var extra = Button("Дополнительно ▾", () => actions.IsOpen = true, "Калибровка, имя группы, возврат BIOS/EC и отчёт оборудования.");
@@ -134,20 +134,20 @@ public sealed partial class Dashboard
         return Surface(panel, new Thickness(16), new Thickness(0, 12, 0, 0));
     }
 
-    async Task<bool> Execute(Action<CoolingSafety> command)
+    async Task<bool> Execute(Func<Task<string>> command)
     {
         if (commandPending || quitting) return false;
         commandPending = true;
         requestError.Text = "Обработка команды…";
         try
         {
-            string result = await monitor.Submit(command).WaitAsync(TimeSpan.FromSeconds(5));
+            string result = await command().WaitAsync(TimeSpan.FromSeconds(5));
             requestError.Text = result;
             return result.Length == 0;
         }
         catch (Exception error)
         {
-            monitor.Release();
+            viewModel.Release();
             Monitor.Log(error);
             requestError.Text = "Команда прервана. Запрошен возврат BIOS/EC.";
             return false;
@@ -159,7 +159,7 @@ public sealed partial class Dashboard
     {
         if (channel is not { } key) return;
         FanProfile requested = selected;
-        if (await Execute(safety => safety.Enable(requested))) SaveSelection(key, requested, confirmed: true);
+        if (await Execute(() => viewModel.Enable(requested))) SaveSelection(key, requested, confirmed: true);
     }
 
     void QueueSpeed()
@@ -177,11 +177,11 @@ public sealed partial class Dashboard
 
     async Task ChangeProfile(FanProfile profile)
     {
-        if (channel == null || latest?.Cooling is not { } cooling || commandPending || monitor.Stalled ||
+        if (channel == null || latest?.Cooling is not { } cooling || commandPending || viewModel.Stalled ||
             (!cooling.CanEnable && !cooling.CanAdjust)) { SetProfileFields(); return; }
         if (!Curve.Valid(profile)) { requestError.Text = "Недопустимая кривая или повторяющиеся датчики."; SetProfileFields(); return; }
         var key = channel;
-        if (cooling.CanAdjust && !await Execute(safety => safety.Adjust(profile))) { SetProfileFields(); return; }
+        if (cooling.CanAdjust && !await Execute(() => viewModel.Adjust(profile))) { SetProfileFields(); return; }
         SaveSelection(key, profile, confirmed: cooling.CanAdjust);
         SetProfileFields();
     }
@@ -192,7 +192,7 @@ public sealed partial class Dashboard
         catch (Exception error)
         {
             Monitor.Log(error);
-            if (confirmed) monitor.Release();
+            if (confirmed) viewModel.Release();
             if (channel == key) selected = preferences.Find(key)?.Current ?? FanProfile.Default;
             requestError.Text = confirmed ? "Не удалось сохранить профиль. Запрошен возврат BIOS/EC." : "Не удалось сохранить профиль.";
         }
@@ -283,7 +283,7 @@ public sealed partial class Dashboard
     {
         if (latest?.Cooling is not { CanCalibrate: true, Identity: { } identity }) return;
         var window = Dialog("Калибровка охлаждения", 585, 470, out StackPanel content);
-        AddWrapped(content, "Проверьте порт и подключение. Выберите только вентиляторы корпуса или радиатора. Помпа и неизвестные цепи остаются под контролем BIOS/EC. Тест длится до 8 секунд: проверяет минимум, затем 100% по одному тахометру хаба.");
+        AddWrapped(content, $"Проверьте порт и подключение. Выберите только вентиляторы корпуса или радиатора. Помпа и неизвестные цепи остаются под контролем BIOS/EC. Тест длится до {CoolingSafety.TestDuration.TotalSeconds:0} секунд: проверяет минимум, затем 100% по одному тахометру хаба.");
         var group = Field(content, "Название группы", "", 48);
         var topology = Field(content, "Разъём, модель хаба и подключённые вентиляторы", "", 150);
         var signal = new ComboBox { ItemsSource = new[] { "Неизвестен", "PWM", "DC" }, SelectedIndex = 0, Margin = new(0, 0, 0, 7) };
@@ -303,13 +303,13 @@ public sealed partial class Dashboard
             result = new(identity, group.Text.Trim(), topology.Text.Trim(), (SignalMode)signal.SelectedIndex, min);
             window.DialogResult = true;
         }));
-        if (window.ShowDialog() == true && result is { } proposal) _ = Execute(safety => safety.BeginCalibration(proposal));
+        if (window.ShowDialog() == true && result is { } proposal) _ = Execute(() => viewModel.Calibrate(proposal));
     }
 
     void EditCurve()
     {
         var window = Dialog("Кривая охлаждения", 570, 565, out StackPanel content);
-        AddWrapped(content, $"Перетащите точку или измените её числа. Точки задают профиль, линия показывает команду с учётом минимума группы {Format(latest?.Cooling.Floor, "%")} и порога 85 °C.");
+        AddWrapped(content, $"Перетащите точку или измените её числа. Точки задают профиль, линия показывает команду с учётом минимума группы {Format(latest?.Cooling.Floor, "%")} и порога {FanPolicy.EmergencyTemperature:0} °C.");
         var canvas = new Canvas { Height = 145, Margin = new(0, 4, 0, 8) };
         canvas.SetResourceReference(Panel.BackgroundProperty, AppTheme.Background);
         content.Children.Add(canvas);
@@ -335,7 +335,7 @@ public sealed partial class Dashboard
             double width = WidthOfPlot(), height = HeightOfPlot();
             var graphPoints = Enumerable.Range(0, 101).Select(t =>
             {
-                float duty = t >= 85 ? 100 : Math.Max(latest?.Cooling.Floor ?? 0, Curve.Interpolate(data!, t));
+                float duty = t >= FanPolicy.EmergencyTemperature ? 100 : Math.Max(latest?.Cooling.Floor ?? 0, Curve.Interpolate(data!, t));
                 return Plot(t, duty);
             });
             var line = new Polyline { StrokeThickness = 2, Points = new PointCollection(graphPoints) };

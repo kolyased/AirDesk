@@ -55,8 +55,7 @@ internal static class ControllerProcesses
 
 internal sealed class LocalCalibration : ICalibrationStore
 {
-    internal static readonly string Folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AirDesk");
-    readonly string profile = Path.Combine(Folder, "fan-binding-v1.json");
+    readonly string profile = Path.Combine(AtomicJson.Folder, "fan-binding-v1.json");
     const string Journal = @"SOFTWARE\AirDesk\Cooling";
     const string Pending = "PendingCaptureV1";
     public Calibration? Saved { get; private set; }
@@ -70,23 +69,7 @@ internal sealed class LocalCalibration : ICalibrationStore
         catch (Exception error) { Monitor.Log(error); }
     }
 
-    internal static void Write<T>(string path, T data)
-    {
-        Directory.CreateDirectory(Folder);
-        string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        try
-        {
-            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            {
-                JsonSerializer.Serialize(stream, data);
-                stream.Flush(flushToDisk: true);
-            }
-            File.Move(temporary, path, overwrite: true);
-        }
-        finally { if (File.Exists(temporary)) File.Delete(temporary); }
-    }
-
-    public void Save(Calibration value) { Write(profile, value); Saved = value; }
+    public void Save(Calibration value) { AtomicJson.Write(profile, value); Saved = value; }
     public void ClearBinding() { File.Delete(profile); Saved = null; }
     public void MarkCapture(ChannelIdentity identity)
     {
@@ -111,7 +94,7 @@ internal sealed class LocalCalibration : ICalibrationStore
     }
 }
 
-internal sealed class WindowsCooling : ICoolingOutput, IDisposable
+internal sealed class WindowsCooling : IFanController, IDisposable
 {
     const string ChipId = "/lpc/nct6779d/0";
     const string ControlId = ChipId + "/control/1";

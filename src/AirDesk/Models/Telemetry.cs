@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using LibreHardwareMonitor.Hardware;
 
 namespace AirDesk;
 
@@ -34,26 +33,7 @@ public record Reading(string Device, string DeviceId, string DeviceType, string 
         return readings.ToArray();
     }
 
-    public static Reading From(IHardware device, ISensor sensor, DateTimeOffset now, ReadingQuality quality)
-    {
-        float? value = sensor.Value is float number && float.IsFinite(number) ? number : null;
-        if (quality == ReadingQuality.Fresh && !value.HasValue) quality = ReadingQuality.NoSensor;
-        if (quality == ReadingQuality.Fresh && device.HardwareType == HardwareType.SuperIO &&
-            sensor.SensorType is SensorType.Temperature or SensorType.Voltage &&
-            (sensor.Name.StartsWith("Temperature #", StringComparison.Ordinal) || sensor.Name.StartsWith("Voltage #", StringComparison.Ordinal)))
-            quality = ReadingQuality.Unverified;
-        string unit = sensor.SensorType switch
-        {
-            SensorType.Temperature => "°C", SensorType.Control or SensorType.Load or SensorType.Level => "%",
-            SensorType.Clock => "МГц", SensorType.Frequency => "Гц", SensorType.Voltage => "В", SensorType.Current => "А",
-            SensorType.Power => "Вт", SensorType.Fan => "об/мин", SensorType.Data => "ГБ", SensorType.SmallData => "МБ",
-            SensorType.Throughput => "Б/с", _ => ""
-        };
-        if (sensor.SensorType == SensorType.Factor && sensor.Name == "Power On Hours") unit = "ч";
-        return new(device.Name, device.Identifier.ToString(), device.HardwareType.ToString(), sensor.Name,
-            sensor.SensorType.ToString(), unit, quality is ReadingQuality.Fresh or ReadingQuality.Unverified ? value : null,
-            sensor.Identifier.ToString(), quality, quality is ReadingQuality.Fresh or ReadingQuality.Unverified ? now : null);
-    }
+
 }
 
 public record Metric(string Label, Reading? Reading, float? Derived = null, string Unit = "", string Section = "",
@@ -176,6 +156,7 @@ public sealed class DeviceReadings
 
 public sealed class Telemetry
 {
+    readonly Dictionary<SensorReference, Reading> bySensor;
     public static readonly Telemetry Empty = new([]);
     public Reading[] Readings { get; }
     public DeviceReadings[] Devices { get; }
@@ -184,16 +165,27 @@ public sealed class Telemetry
     public DeviceReadings[] Gpus { get; }
     public DeviceReadings[] Disks { get; }
     public TemperatureInput[] CurveSources { get; }
+    public Reading[] HistorySources { get; }
+    public Reading? Find(SensorReference sensor) => bySensor.GetValueOrDefault(sensor);
+
+    public static TimeSpan MaxAge(string deviceType) => deviceType switch
+    {
+        "Storage" => TimeSpan.FromSeconds(22), "Memory" => TimeSpan.FromSeconds(8), _ => TimeSpan.FromSeconds(4)
+    };
 
     public Telemetry(Reading[] readings)
     {
         Readings = readings;
+        bySensor = readings.GroupBy(r => r.Reference).Where(group => group.Count() == 1).ToDictionary(group => group.Key, group => group.Single());
         Devices = readings.GroupBy(reading => reading.DeviceId).OrderBy(group => group.Key, StringComparer.Ordinal)
             .Select(group => new DeviceReadings(group)).ToArray();
         Cpu = Devices.FirstOrDefault(device => device.Type == "Cpu");
         Ram = Devices.SingleOrDefault(device => device.Id == "/ram");
         Gpus = Devices.Where(device => device.Gpu).ToArray();
         Disks = Devices.Where(device => device.Disk).ToArray();
+        HistorySources = Devices.SelectMany(device => new[] { device.Temperature, device.Load, device.Hotspot })
+            .OfType<Reading>().Concat(readings.Where(reading => reading.Kind == "Fan" && reading.Value > 0 && reading.DeviceType == "SuperIO"))
+            .DistinctBy(reading => reading.Reference).ToArray();
         CurveSources = Devices.Where(device => device.Type == "Cpu" || device.Gpu)
             .Where(device => Devices.Count(other => other.Type == device.Type && other.Name == device.Name) == 1)
             .SelectMany(device => device.Readings.Where(reading => reading.Kind == "Temperature" &&

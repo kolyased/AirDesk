@@ -1,20 +1,17 @@
 using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using LibreHardwareMonitor.Hardware;
 
 namespace AirDesk;
 
-public record Snapshot(DateTimeOffset Time, Telemetry Telemetry, CoolingView Cooling, string? PollIssue);
+public record Snapshot(DateTimeOffset Time, Telemetry Telemetry, CoolingView Cooling, string? PollIssue, PollDiagnostics Polling);
 
 public sealed class Monitor
 {
     readonly bool monitorOnly;
+    readonly Func<ISensorProvider>? sensorFactory;
     readonly ConcurrentQueue<(Action<CoolingSafety> Action, TaskCompletionSource<string> Result)> commands = new();
     readonly AutoResetEvent wake = new(false);
     readonly TaskCompletionSource<CoolingView?> finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -23,7 +20,12 @@ public sealed class Monitor
     int stopping, releaseRequested, watchdogReported;
     volatile Snapshot? latest;
     public Snapshot? Latest => latest;
-    public Monitor(bool monitorOnly = false) => this.monitorOnly = monitorOnly;
+    public Monitor(bool monitorOnly = false, Func<ISensorProvider>? sensorFactory = null)
+    {
+        this.monitorOnly = monitorOnly;
+        this.sensorFactory = sensorFactory;
+    }
+    internal Action<Telemetry, DateTimeOffset>? Sampled { get; set; }
     public bool Stalled => Volatile.Read(ref stopping) == 0 && elapsed.ElapsedTicks - Interlocked.Read(ref lastProgress) >=
         (long)(Stopwatch.Frequency * CoolingSafety.Freshness.TotalSeconds);
 
@@ -58,16 +60,18 @@ public sealed class Monitor
 
     void Run()
     {
-        var computer = new Computer { IsCpuEnabled = true, IsMotherboardEnabled = true, IsMemoryEnabled = true,
-            IsGpuEnabled = true, IsStorageEnabled = true };
         CoolingSafety? safety = null;
         WindowsCooling? adapter = null;
+        ISensorProvider? provider = null;
         Telemetry telemetry = Telemetry.Empty;
+        PollDiagnostics polling = PollDiagnostics.Empty;
+        var interval = TimeSpan.FromMilliseconds(850);
         string? pollIssue = null;
         bool StopPending() => Volatile.Read(ref stopping) != 0 || Volatile.Read(ref releaseRequested) != 0;
         try
         {
             adapter = new WindowsCooling();
+            provider = sensorFactory?.Invoke() ?? new LibreSensorProvider(adapter);
             using var deadline = new Timer(_ =>
             {
                 long due = Interlocked.Read(ref testDeadline);
@@ -80,8 +84,7 @@ public sealed class Monitor
                 }
             }, null, 100, 100);
             safety = new(adapter, new LocalCalibration(), ControllerProcesses.Scan, () => elapsed.Elapsed, LogEvent, StopPending);
-            computer.Open();
-            adapter.Discover(computer.Hardware.SelectMany(Walk).ToArray());
+            provider.Open();
             TimeSpan nextPoll = TimeSpan.Zero, nextTick = TimeSpan.Zero, nextDiscovery = elapsed.Elapsed + TimeSpan.FromSeconds(5);
             while (!safety.ShutdownComplete)
             {
@@ -98,7 +101,7 @@ public sealed class Monitor
                 if (elapsed.Elapsed >= nextTick || expired || Volatile.Read(ref stopping) != 0)
                 {
                     safety.Tick();
-                    nextTick = elapsed.Elapsed + TimeSpan.FromMilliseconds(200);
+                    nextTick = elapsed.Elapsed + TimeSpan.FromMilliseconds(safety.OwnsOutput ? 200 : 850);
                 }
                 Publish();
                 if (safety.ShutdownComplete) break;
@@ -115,39 +118,27 @@ public sealed class Monitor
                     TimeSpan started = elapsed.Elapsed;
                     try
                     {
-                        var readings = new List<Reading>();
-                        var available = computer.Hardware.SelectMany(Walk).ToArray();
-                        if (adapter.RetryDiscovery && elapsed.Elapsed >= nextDiscovery)
-                        {
-                            adapter.Discover(available);
-                            nextDiscovery = elapsed.Elapsed + TimeSpan.FromSeconds(5);
-                        }
-                        foreach (var hardware in available)
-                        {
-                            try
-                            {
-                                adapter.Update(hardware);
-                                DateTimeOffset now = DateTimeOffset.UtcNow;
-                                var quality = hardware.HardwareType == HardwareType.SuperIO && adapter.BoardUpdateBlocked ? ReadingQuality.Stale : ReadingQuality.Fresh;
-                                readings.AddRange(hardware.Sensors.Select(sensor => Reading.From(hardware, sensor, now, quality)));
-                            }
-                            catch (Exception error)
-                            {
-                                Log(error);
-                                readings.AddRange(hardware.Sensors.Select(sensor => Reading.From(hardware, sensor, DateTimeOffset.UtcNow,
-                                    error is UnauthorizedAccessException ? ReadingQuality.AccessDenied : ReadingQuality.Unresponsive)));
-                            }
-                        }
-                        pollIssue = elapsed.Elapsed - started >= CoolingSafety.Freshness ? "Опрос оборудования превысил допустимое время." : null;
-                        telemetry = new Telemetry(Reading.MergePoll(readings.ToArray(), telemetry.Readings,
-                            available.Select(device => (device.Identifier.ToString(), device.Name)).ToHashSet(),
-                            DateTimeOffset.UtcNow, CoolingSafety.Freshness));
-                        if (pollIssue != null) safety.Interrupt(pollIssue, true);
+                        bool discover = adapter.RetryDiscovery && started >= nextDiscovery && !safety.OwnsOutput;
+                        if (discover) nextDiscovery = started + TimeSpan.FromSeconds(5);
+                        SensorPoll samples = provider.Poll(started, discover);
+                        var duration = elapsed.Elapsed - started;
+                        long missed = polling.Polls == 0 ? 0 : (long)((elapsed.Elapsed - nextPoll).TotalMilliseconds / interval.TotalMilliseconds);
+                        polling = polling.Observe(duration, missed, samples);
+                        bool tooSlow = duration >= CoolingSafety.Freshness;
+                        pollIssue = tooSlow ? "Опрос оборудования превысил допустимое время." :
+                            samples.FailedDevices > 0 ? $"Недоступны показания устройств: {samples.FailedDevices}." : null;
+                        telemetry = samples.Telemetry;
+                        if (tooSlow) safety.Interrupt(pollIssue!, true);
                         // A delayed poll must not revive a test or a stale control session.
                         safety.TickBeforeSample();
                         safety.Observe(monitorOnly ? new FanSample(null, null, null, null, false,
                             "AirDesk запущен вместе с Windows. В этом сеансе доступен мониторинг.") : adapter.Sample(telemetry));
                         safety.Tick();
+                        if (!tooSlow)
+                        {
+                            try { Sampled?.Invoke(telemetry, DateTimeOffset.UtcNow); }
+                            catch (Exception error) { Log(error); }
+                        }
                     }
                     catch (Exception error)
                     {
@@ -156,7 +147,8 @@ public sealed class Monitor
                         safety.Interrupt(pollIssue, true);
                         safety.Tick();
                     }
-                    nextPoll = elapsed.Elapsed + TimeSpan.FromMilliseconds(850);
+                    var next = nextPoll + interval;
+                    nextPoll = next > elapsed.Elapsed ? next : elapsed.Elapsed + interval;
                     Publish();
                 }
                 wake.WaitOne(100);
@@ -165,7 +157,11 @@ public sealed class Monitor
             void Publish()
             {
                 Interlocked.Exchange(ref testDeadline, safety.Deadline?.Ticks ?? 0);
-                latest = new(DateTimeOffset.Now, telemetry, safety.View(), pollIssue);
+                var cooling = safety.View();
+                var previous = latest;
+                if (previous == null || previous.Telemetry != telemetry || previous.Cooling != cooling ||
+                    previous.PollIssue != pollIssue || previous.Polling != polling)
+                    latest = new(DateTimeOffset.Now, telemetry, cooling, pollIssue, polling);
             }
         }
         catch (Exception error)
@@ -182,13 +178,13 @@ public sealed class Monitor
                 }
             }
             var previous = latest;
-            if (safety != null) latest = new(DateTimeOffset.Now, previous?.Telemetry ?? Telemetry.Empty, safety.View(), error.Message);
+            if (safety != null) latest = new(DateTimeOffset.Now, previous?.Telemetry ?? Telemetry.Empty, safety.View(), error.Message, polling);
         }
         finally
         {
             Interlocked.Exchange(ref stopping, 1);
             CancelQueued();
-            try { computer.Close(); }
+            try { provider?.Dispose(); }
             catch (Exception error) { Log(error); }
             finally { adapter?.Dispose(); }
             finished.TrySetResult(safety?.View());
@@ -200,25 +196,6 @@ public sealed class Monitor
         while (commands.TryDequeue(out var item)) item.Result.TrySetResult("Команда отменена.");
     }
 
-    static IEnumerable<IHardware> Walk(IHardware hardware)
-    {
-        yield return hardware;
-        foreach (var child in hardware.SubHardware)
-            foreach (var item in Walk(child)) yield return item;
-    }
-
-    public static void Log(Exception error) => LogEvent(error.ToString());
-
-    static void LogEvent(string message)
-    {
-        try
-        {
-            Directory.CreateDirectory(LocalCalibration.Folder);
-            string file = Path.Combine(LocalCalibration.Folder, "cooling.log");
-            if (new FileInfo(file).Exists && new FileInfo(file).Length > 1_000_000) File.Move(file, file + ".old", true);
-            File.AppendAllText(file, $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}");
-        }
-        catch (IOException error) { Trace.TraceError(error.Message); }
-        catch (UnauthorizedAccessException error) { Trace.TraceError(error.Message); }
-    }
+    public static void Log(Exception error) => DiagnosticLog.Write(error.ToString());
+    static void LogEvent(string message) => DiagnosticLog.Write(message);
 }
