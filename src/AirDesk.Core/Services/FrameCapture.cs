@@ -95,7 +95,8 @@ internal sealed class FrameCapture : IDisposable
     {
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, buffer.Length, useAsync: true);
         long end = stream.Length;
-        DateTime created = File.GetCreationTimeUtc(stream.SafeFileHandle);
+        // On Unix, creation time can be synthesized from timestamps that change on append.
+        DateTime created = OperatingSystem.IsWindows() ? File.GetCreationTimeUtc(stream.SafeFileHandle) : default;
         if (parser == null || created != stamp || end < offset || !await HasSameHeader(stream, cancel).ConfigureAwait(false))
         {
             parser = null;

@@ -214,9 +214,12 @@ public sealed class HistoryTests(ITestOutputHelper output)
             history.Offer(new Telemetry([DiskTemperature(0, now) with { Value = 45 }]), now);
             string file = Path.Combine(directory.FullName, "history-v2.json.gz");
             Assert.False(File.Exists(file));
+            Assert.Null(history.SavedRange);
+            Assert.Equal((now, now), HistoryModel.RecordedRange(history.Read()));
             history.Configure(HistoryRetention.Off);
             using var deadline = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(3));
-            while (!File.Exists(file)) await Task.Delay(20, deadline.Token);
+            while (history.SavedRange == null) await Task.Delay(20, deadline.Token);
+            Assert.Equal((now, now), history.SavedRange);
             Assert.Equal(45f, Assert.Single(HistoryJournal.Read(file)).Mean);
             await history.StopAsync();
         }

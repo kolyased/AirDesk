@@ -61,8 +61,8 @@ public sealed partial class Dashboard
         if (settingsHistoryRecorded.IsVisible && (force || lastHistorySettingsRevision != revision))
         {
             lastHistorySettingsRevision = revision;
-            string range = HistoryRangeText(viewModel.History.Read());
-            settingsHistoryRecorded.Text = viewModel.History.Error is { } error ? $"{range}\n{error}" : range;
+            string savedText = viewModel.History.SavedRange is { } saved ? HistoryRangeText(saved, "Сохранено на диске") : "На диске пока нет записей.";
+            settingsHistoryRecorded.Text = viewModel.History.Error is { } error ? $"{savedText}\n{error}" : savedText;
         }
         if (!historyPlot.IsVisible || !force && lastHistoryRevision == revision) return;
         lastHistoryRevision = revision;
@@ -88,19 +88,19 @@ public sealed partial class Dashboard
         sensor = (historySensor.SelectedItem as HistoryChoice)?.Sensor;
         DateTimeOffset cutoff = DateTimeOffset.UtcNow - HistoryViewPeriod();
         var recorded = all.Where(p => p.Sensor == sensor).ToArray();
-        historyRecorded.Text = HistoryRangeText(recorded);
+        historyRecorded.Text = HistoryModel.RecordedRange(recorded) is { } range
+            ? HistoryRangeText(range, "Собраны показания") : "В истории пока нет записей.";
         visibleHistory = recorded.Where(p => p.At >= cutoff).OrderBy(p => p.At).ToArray();
         DrawHistory();
     }
 
-    static string HistoryRangeText(IEnumerable<HistoryPoint> rows)
+    static string HistoryRangeText((DateTimeOffset From, DateTimeOffset At) range, string label)
     {
-        if (HistoryModel.RecordedRange(rows) is not { } range) return "В истории пока нет записей.";
         var span = range.At - range.From;
         string duration = span.TotalDays >= 1 ? $"{span.Days} д {span.Hours} ч" :
             span.TotalHours >= 1 ? $"{span.Hours} ч {span.Minutes} мин" :
             span.TotalMinutes >= 1 ? $"{span.Minutes} мин {span.Seconds} с" : $"{span.Seconds} с";
-        return $"Собраны показания с {range.From.LocalDateTime:dd.MM.yyyy HH:mm:ss} по {range.At.LocalDateTime:dd.MM.yyyy HH:mm:ss} · {duration}.";
+        return $"{label} с {range.From.LocalDateTime:dd.MM.yyyy HH:mm:ss} по {range.At.LocalDateTime:dd.MM.yyyy HH:mm:ss} · {duration}.";
     }
 
     string? HistoryDeviceInstance(string id, string name) => latest?.Telemetry.Gpus

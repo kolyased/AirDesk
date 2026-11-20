@@ -17,6 +17,7 @@ internal sealed class HistoryStore
     readonly SemaphoreSlim disk = new(1, 1);
     readonly Task loading;
     DateTimeOffset lastSample, lastFlush = DateTimeOffset.UtcNow;
+    (DateTimeOffset From, DateTimeOffset At)? savedRange;
     HistoryRetention retention;
     HashSet<SensorReference>? sensors;
     long removedPending;
@@ -27,6 +28,7 @@ internal sealed class HistoryStore
     public string? Error => error;
     public HistoryRetention Retention { get { lock (gate) return retention; } }
     public int Revision { get { lock (gate) return revision; } }
+    public (DateTimeOffset From, DateTimeOffset At)? SavedRange { get { lock (gate) return savedRange; } }
 
     public HistoryStore(string? folder = null)
     {
@@ -51,6 +53,7 @@ internal sealed class HistoryStore
             lock (gate)
             {
                 archive = rows.Where(point => point?.Valid == true).OrderBy(point => point.At).TakeLast(HistoryModel.MaxPoints).ToArray();
+                savedRange = HistoryModel.RecordedRange(archive);
                 foreach (var point in archive) observed[point.Sensor] = point.At;
                 revision++;
             }
@@ -152,9 +155,11 @@ internal sealed class HistoryStore
         while (!HistoryJournal.TryEncode(compact, encoded))
             compact = compact.Skip(Math.Max(1, compact.Length / 10)).ToArray();
         AtomicJson.WriteFile(path, stream => encoded.CopyTo(stream));
+        var range = HistoryModel.RecordedRange(compact);
         lock (gate)
         {
             archive = compact;
+            savedRange = range;
             DiscardPending((int)Math.Clamp(endOfBatch - removedPending, 0, pending.Count));
             revision++;
             error = null;
@@ -187,7 +192,7 @@ internal sealed class HistoryStore
                     File.Delete(legacyPath);
                     File.Delete(path);
                     legacyLoaded = false;
-                    archive = []; pending.Clear(); observed.Clear();
+                    archive = []; pending.Clear(); observed.Clear(); savedRange = null;
                     revision++;
                     lastSample = DateTimeOffset.UtcNow;
                 }
