@@ -85,11 +85,13 @@ public static class Curve
         TemperatureInput? Find(SensorReference source) => inputs.SingleOrDefault(input => input.Source == source);
         var first = profile.Primary == null ? null : Find(profile.Primary);
         float? primary = profile.Primary == null ? cpu : first?.Celsius;
+        if (!FanPolicy.ValidTemperature(primary)) primary = null;
         string primaryLabel = profile.Primary == null ? "CPU Package (авто)" : first?.Label ?? profile.Primary.Id;
         if (profile.Secondary == null) return (primary, primaryLabel);
         var second = Find(profile.Secondary);
         string label = $"Максимум из {primaryLabel} и {second?.Label ?? profile.Secondary.Id}";
-        return primary.HasValue && second?.Celsius is float secondary ? (Math.Max(primary.Value, secondary), label) : (null, label);
+        return primary is float value && second?.Celsius is float secondary && FanPolicy.ValidTemperature(secondary)
+            ? (Math.Max(value, secondary), label) : (null, label);
     }
 }
 

@@ -7,7 +7,7 @@ using Xunit;
 public sealed class SafetyTests
 {
     static readonly ChannelIdentity Id = new("Intel", "X99", "2", "5.11", "Nuvoton", "/control/1", "/fan/1", "CPU", "PawnIO 2.2", "0.9.6", 1);
-    static readonly Calibration Profile = new(Id, "Радиатор", "SYS_FAN, PWM hub", SignalMode.Pwm, 65);
+    static readonly Calibration Profile = new(Id, "Радиатор", "SYS_FAN, PWM hub", SignalMode.Pwm, 65) { RangeVerified = true };
     static readonly FanProfile Manual = FanProfile.Default with { Kind = ProfileKind.Manual, Manual = 42 };
     static readonly SensorReference Gpu = new("gpu-temperature", "gpu0", "Card 1");
 
@@ -53,6 +53,100 @@ public sealed class SafetyTests
         rig.Advance(.01);
         Assert.Equal(1, rig.Output.Restores);
         Assert.True(rig.Safety.View().CanSave);
+    }
+
+    [Fact]
+    public void CalibrationCannotSaveWhenMaximumMatchesTheChosenFloorRpm()
+    {
+        var rig = new Rig();
+        rig.Seed();
+        rig.Safety.BeginCalibration(Profile);
+        for (int i = 0; i < 3; i++) rig.Advance(1, rpm: 1800, duty: 65);
+        for (int i = 0; i < 4; i++) rig.Advance(1, rpm: 1800, duty: 100);
+        rig.Advance(1);
+
+        Assert.Equal(new[] { 65f, 100f }, rig.Output.Writes);
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.False(rig.Safety.View().CanSave);
+        Assert.Null(rig.Store.Saved);
+    }
+
+    [Fact]
+    public void CalibrationAtOneHundredPercentCannotEstablishAnOperatingRange()
+    {
+        var rig = new Rig();
+        rig.Seed();
+
+        Reject(() => rig.Safety.BeginCalibration(Profile with { Floor = 100 }));
+        Assert.Empty(rig.Output.Writes);
+        Assert.False(rig.Store.RecoveryPending);
+    }
+
+    [Theory]
+    [InlineData(65)]
+    [InlineData(99)]
+    public void CalibrationStopsWhenOutputDoesNotMatchDuringMeasurement(float floor)
+    {
+        var rig = new Rig();
+        rig.Seed();
+        rig.Safety.BeginCalibration(Profile with { Floor = floor });
+        for (int i = 0; i < 3; i++) rig.Advance(1, rpm: 1370, duty: floor);
+        rig.Advance(1, rpm: 1800, duty: floor);
+
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.False(rig.Safety.View().CanSave);
+        Assert.False(rig.Store.RecoveryPending);
+    }
+
+    [Fact]
+    public void CalibrationStopsWhenFloorAlreadyReadsBackAsFullOutput()
+    {
+        var rig = new Rig();
+        rig.Seed();
+        rig.Output.ReadbackOverride = 100;
+        rig.Safety.BeginCalibration(Profile with { Floor = 99.8f });
+
+        Assert.Equal(ChannelState.Restoring, rig.Safety.View().State);
+        rig.Safety.Tick();
+        Assert.Equal(new[] { 99.8f }, rig.Output.Writes);
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.False(rig.Safety.View().CanSave);
+        Assert.False(rig.Store.RecoveryPending);
+    }
+
+    [Fact]
+    public void CalibrationStopsWhenFullOutputCannotBeConfirmed()
+    {
+        var rig = new Rig();
+        rig.Seed();
+        rig.Safety.BeginCalibration(Profile);
+        rig.Output.ReadbackOverride = 99;
+        for (int i = 0; i < 3; i++) rig.Advance(1, rpm: 1370, duty: 65);
+
+        Assert.Equal(new[] { 65f, 100f }, rig.Output.Writes);
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.False(rig.Safety.View().CanSave);
+    }
+
+    [Fact]
+    public void CalibrationIsUnavailableWhenBiosLeavesNoUsableFloor()
+    {
+        var rig = new Rig();
+        for (int i = 0; i < 3; i++) rig.Observe(duty: 99.1f);
+
+        Assert.False(rig.Safety.View().CanCalibrate);
+        Assert.Empty(rig.Output.Writes);
+    }
+
+    [Fact]
+    public void ABindingWithoutRangeVerificationRequiresRecalibration()
+    {
+        var rig = new Rig(Profile with { RangeVerified = false });
+
+        Assert.False(rig.Safety.View().CanConfirm);
+        Reject(rig.Safety.ConfirmUnchangedTopology);
+        Reject(() => rig.Safety.Enable(Manual));
+        Assert.Empty(rig.Output.Writes);
     }
 
     [Fact]
@@ -155,7 +249,7 @@ public sealed class SafetyTests
         rig.Seed();
         Reject(() => rig.Safety.BeginCalibration(Profile with { Signal = SignalMode.Unknown }));
         Reject(() => rig.Safety.BeginCalibration(Profile with { Floor = 59 }));
-        rig.Safety.BeginCalibration(Profile);
+        rig.Safety.BeginCalibration(Profile with { RangeVerified = false });
         Check(rig.Output.Writes.SequenceEqual([65f]), "Calibration starts at a user-confirmed floor above the autonomous output");
         for (int i = 0; i < 3; ++i) rig.Advance(1, rpm: 1370, duty: 65);
         Check(rig.Output.Writes.SequenceEqual([65f, 100]), "Calibration raises to 100% after floor checks");
@@ -260,12 +354,17 @@ public sealed class SafetyTests
         Check(rig.Output.Writes.Count == 1 && rig.Output.Restores == 1, "Changed identity revokes binding without speed command");
     }
 
-    [Fact]
-    public void MissingSecondarySourceTriggersEmergency()
+    [Theory]
+    [InlineData(null)]
+    [InlineData(float.NaN)]
+    [InlineData(float.PositiveInfinity)]
+    [InlineData(float.NegativeInfinity)]
+    [InlineData(126f)]
+    public void InvalidSecondarySourceTriggersEmergencyAndRestore(float? temperature)
     {
         var rig = Rig.Active();
         rig.Safety.Adjust(FanProfile.Default with { Secondary = Gpu });
-        rig.Observe(gpu: null, duty: rig.Output.Writes.Last());
+        rig.Observe(gpu: temperature, duty: rig.Output.Writes.Last());
         rig.Safety.Tick();
         Check(rig.Output.Writes.Last() == 100 && rig.Output.Restores == 1, "Missing one source of a maximum fails safe");
     }
@@ -379,10 +478,11 @@ public sealed class SafetyTests
         public List<float> Writes { get; } = new();
         public int Restores, RestoreFailures;
         public bool ReadbackMatches = true;
+        public float? ReadbackOverride;
         public Action? BeforeGuard;
         public void Acquire() { }
         public void ReleaseLease() { }
-        public float? Write(float percent, Action guard) { BeforeGuard?.Invoke(); guard(); Writes.Add(percent); return ReadbackMatches ? percent : null; }
+        public float? Write(float percent, Action guard) { BeforeGuard?.Invoke(); guard(); Writes.Add(percent); return ReadbackMatches ? ReadbackOverride ?? percent : null; }
         public RestoreResult Restore() => ++Restores <= RestoreFailures ? new(false, false, "fault") : new(true, true, "confirmed");
     }
 

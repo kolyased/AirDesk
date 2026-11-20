@@ -45,7 +45,7 @@ public sealed partial class Dashboard
         calibrate = MenuAction("Калибровка разъёма…", Calibrate, "Подтверждение подключения и проверка отклика вентиляторов.");
         saveCalibration = Button("Подтвердить назначение", () =>
         {
-            if (MessageBox.Show(this, "По тесту и осмотру вы подтвердили, какие вентиляторы подключены, и проверили выбранный минимум для всей группы?",
+            if (MessageBox.Show(this, "Вы подтвердили подключение и устойчивое вращение всей группы на минимуме? BIOS/EC снова регулирует обороты после теста?",
                 "Сохранить привязку", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
                 _ = Execute(viewModel.SaveCalibration);
         });
@@ -237,7 +237,7 @@ public sealed partial class Dashboard
             ChannelState.Verified => "Проверен", ChannelState.Controlled => "AirDesk", ChannelState.Error => "Ошибка",
             ChannelState.Conflict => "Конфликт", ChannelState.Restoring => "Возврат BIOS/EC", _ => "—"
         };
-        channelStatus.Text = $"{cooling.Group ?? "Разъём охлаждения"} · {mode}\n{FriendlyStatus(cooling)}";
+        channelStatus.Text = $"{cooling.Group ?? "Разъём охлаждения"} · {mode}\n{cooling.Reason}";
         channelStatus.ToolTip = cooling.Channel ?? cooling.Reason;
         string confirmation = !stale && cooling.LastWriteUtc is { } stamp && DateTimeOffset.TryParse(stamp, out var time)
             ? time.ToLocalTime().ToString("HH:mm:ss") : "—";
@@ -283,12 +283,12 @@ public sealed partial class Dashboard
     {
         if (latest?.Cooling is not { CanCalibrate: true, Identity: { } identity }) return;
         var window = Dialog("Калибровка охлаждения", 585, 470, out StackPanel content);
-        AddWrapped(content, $"Проверьте порт и подключение. Выберите только вентиляторы корпуса или радиатора. Помпа и неизвестные цепи остаются под контролем BIOS/EC. Тест длится до {CoolingSafety.TestDuration.TotalSeconds:0} секунд: проверяет минимум, затем 100% по одному тахометру хаба.");
+        AddWrapped(content, $"Подтвердите подключение вентиляторов корпуса или радиатора. Помпа и неизвестные цепи остаются под контролем BIOS/EC. На измерения отведено до {CoolingSafety.TestDuration.TotalSeconds:0} секунд. Дождитесь результата возврата BIOS/EC.");
         var group = Field(content, "Название группы", "", 48);
         var topology = Field(content, "Разъём, модель хаба и подключённые вентиляторы", "", 150);
         var signal = new ComboBox { ItemsSource = new[] { "Неизвестен", "PWM", "DC" }, SelectedIndex = 0, Margin = new(0, 0, 0, 7) };
         content.Children.Add(Text("Тип сигнала по настройкам BIOS или документации", 12)); content.Children.Add(signal);
-        var floor = Field(content, "Минимум запуска и устойчивого вращения всей группы в %", "100", 3);
+        var floor = Field(content, "Минимум запуска и устойчивого вращения всей группы в %", "", 3);
         var check = new CheckBox { Content = Text("Подключение проверено. Все вентиляторы запускаются и держат обороты на указанном минимуме.", 13),
             Margin = new(0, 5, 0, 12) };
         ((TextBlock)check.Content).TextWrapping = TextWrapping.Wrap;
@@ -298,8 +298,8 @@ public sealed partial class Dashboard
         content.Children.Add(Button("Начать контролируемый тест", () =>
         {
             if (check.IsChecked != true || signal.SelectedIndex < 1 || string.IsNullOrWhiteSpace(group.Text) || string.IsNullOrWhiteSpace(topology.Text) ||
-                !float.TryParse(floor.Text, out float min) || min is < 40 or > 100 || !float.IsFinite(min))
-            { error.Text = "Подтвердите подключение, заполните поля и укажите проверенный минимум."; return; }
+                !float.TryParse(floor.Text, out float min) || min is < 40 or >= 100 || !float.IsFinite(min))
+            { error.Text = "Подтвердите подключение, заполните поля и укажите проверенный минимум от 40% до значения ниже 100%."; return; }
             result = new(identity, group.Text.Trim(), topology.Text.Trim(), (SignalMode)signal.SelectedIndex, min);
             window.DialogResult = true;
         }));

@@ -8,7 +8,10 @@ public enum ChannelState { Unavailable, MonitorOnly, Unverified, Verified, Contr
 public enum SignalMode { Unknown, Pwm, Dc }
 public record ChannelIdentity(string BoardVendor, string Board, string Revision, string Firmware, string Chip,
     string Control, string Tachometer, string Temperature, string Driver, string Library, int Definition);
-public record Calibration(ChannelIdentity Identity, string Group, string Topology, SignalMode Signal, float Floor);
+public record Calibration(ChannelIdentity Identity, string Group, string Topology, SignalMode Signal, float Floor)
+{
+    public bool RangeVerified { get; init; }
+}
 public record FanSample(ChannelIdentity? Identity, float? Cpu, float? Rpm, float? Duty, bool Available, string Reason,
     TemperatureInput[]? Inputs = null);
 public record RestoreResult(bool Completed, bool Confirmed, string Detail);
@@ -67,9 +70,10 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     bool HardwareReady => sample is { Available: true, Identity: not null, Rpm: float rpm } && float.IsFinite(rpm) &&
         rpm > 0 && sample.Duty is >= 0 and <= 100 && SafeCpu;
     bool Idle => !closed && !stopRequested() && captured == null && !restoring && conflict == null && !storageFailed && !store.RecoveryPending;
-    bool CanCalibrate => Idle && HardwareReady && sample!.Cpu < 75 && baseline.Count >= 3 &&
+    bool CanCalibrate => Idle && HardwareReady && sample!.Cpu < 75 && sample.Duty <= 99 && baseline.Count >= 3 &&
         baseline.Max() - baseline.Min() <= Math.Max(125, Median(baseline.ToArray()) * .08f);
     bool CanEnable => Idle && HardwareReady && verified?.Identity == sample!.Identity && verified != null;
+    Calibration? SavedBinding => store.Saved is { RangeVerified: true } saved && Valid(saved) ? saved : null;
     public bool OwnsOutput => captured != null;
     public bool ShutdownComplete => closed && !restoring;
     public TimeSpan? Deadline => testEnd;
@@ -87,13 +91,14 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
         else if (sample?.Identity == null) (state, reason) = (ChannelState.MonitorOnly, sample?.Reason ?? "Обнаружение оборудования…");
         else if (!HardwareReady) (state, reason) = (ChannelState.Unavailable, UnavailableReason());
         else if (verified != null) (state, reason) = (ChannelState.Verified, "Привязка проверена. Управление остаётся у BIOS/EC до включения.");
+        else if (sample.Duty > 99) (state, reason) = (ChannelState.Unverified, "Текущий выход BIOS/EC слишком высок для проверки диапазона. Дождитесь снижения нагрузки и оборотов.");
         else (state, reason) = (ChannelState.Unverified, "Нужно подтвердить подключение и откалибровать канал.");
         return new(state, reason, lastAction, restoreStatus, conflict, CanCalibrate, CanEnable, active && conflict == null && !restoring,
             captured != null && !restoring, store.RecoveryPending && captured == null && conflict == null && !closed && !stopRequested() && sample?.Identity != null,
             Idle && candidate != null && candidate.Identity == sample?.Identity,
             verified?.Floor ?? candidate?.Floor, verified?.Group ?? store.Saved?.Group, sample?.Identity?.Control,
             sample?.Rpm, command, sample?.Identity, LastPollUtc?.ToString("O"), LastWriteUtc?.ToString("O"),
-            Idle && HardwareReady && store.Saved?.Identity == sample?.Identity && store.Saved != null,
+            Idle && HardwareReady && SavedBinding?.Identity == sample!.Identity,
             requested, sentCommand, sourceLabel, Idle && verified != null, store.RecoveryPending && captured == null);
     }
 
@@ -134,14 +139,17 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
         else if (captured == null) baseline.Clear();
         if (command is float sent && (active || testing))
         {
-            if (value.Duty is float duty && Math.Abs(duty - sent) <= 2)
+            bool matches = value.Duty is float duty && Math.Abs(duty - sent) <= 2;
+            if (testing) matches &= testingFloor ? value.Duty < 100 : value.Duty == 100;
+            if (matches)
             {
                 mismatches = 0;
                 lastWrite = clock();
             }
-            else if (++mismatches >= 2)
+            else if (testing || ++mismatches >= 2)
             {
-                Interrupt("Показания выхода изменились без команды AirDesk. Кто управляет каналом, установить не удалось.", false);
+                Interrupt(testing ? "Показание выхода не соответствует команде калибровки. Тест остановлен." :
+                    "Показания выхода изменились без команды AirDesk. Кто управляет каналом, установить не удалось.", false);
                 return;
             }
         }
@@ -187,7 +195,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     {
         conflict = conflictScan();
         if (!CanCalibrate || proposal.Identity != sample!.Identity || !Valid(proposal) || proposal.Floor < Math.Ceiling(sample.Duty!.Value))
-            throw new InvalidOperationException("Калибровка недоступна. Нужны свежий CPU ниже 75 °C, стабильный тахометр, подтверждённое подключение и минимум не ниже текущего выхода BIOS.");
+            throw new InvalidOperationException("Калибровка недоступна. Нужны свежие показания CPU ниже 75 °C, стабильный тахометр и подтверждённое подключение. Минимум должен быть от 40% до значения ниже 100% и не ниже текущего выхода BIOS.");
         candidate = verified = null;
         response.Clear();
         floorSamples.Clear();
@@ -197,11 +205,11 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
             pendingProposal = proposal;
             testing = true;
             testEnd = clock() + TestDuration;
-            testingFloor = proposal.Floor < 100;
+            testingFloor = true;
             requested = proposal.Floor;
-            Write(proposal.Floor);
-            SetAction(testingFloor ? $"Калибровка: проверяется удержание оборотов на {proposal.Floor:0}%." :
-                "Калибровка: выход 100%, собираются показания тахометра хаба.");
+            if (Write(proposal.Floor) >= 100)
+                throw new InvalidOperationException("На выбранном минимуме контроллер уже подтвердил 100%. Тест остановлен.");
+            SetAction($"Калибровка: проверяется удержание оборотов на {proposal.Floor:0.#}%.");
         }
         catch (Exception error) { Interrupt(error.Message, false); }
     }
@@ -210,7 +218,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
 
     void RaiseTestSpeed()
     {
-        if (floorSamples.Count < 2 || floorSamples.Min() < baseline.Min() - Math.Max(100, baseline.Min() * .1f))
+        if (floorSamples.Count < 3 || floorSamples.Min() < baseline.Min() - Math.Max(100, baseline.Min() * .1f))
         {
             Interrupt("Не подтверждено удержание оборотов на выбранном минимуме. Тест остановлен.", false);
             return;
@@ -219,7 +227,8 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
         {
             testingFloor = false;
             requested = 100;
-            Write(100);
+            if (Write(100) != 100)
+                throw new InvalidOperationException("Контроллер не подтвердил выход 100%. Тест остановлен.");
             SetAction("Калибровка: выход 100%, собираются показания тахометра хаба.");
         }
         catch (Exception error) { Interrupt(error.Message, false); }
@@ -228,13 +237,14 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     void EndTest()
     {
         var before = baseline.ToArray();
+        var floor = floorSamples.ToArray();
         var after = response.ToArray();
-        if (!testingFloor && HasResponse(before, after))
+        if (pendingProposal is { } proposal && !testingFloor && HasResponse(before, after) && HasResponse(floor, after))
         {
-            candidate = pendingProposal;
-            SetAction($"Отклик тахометра {Median(before):0} → {Median(after):0} об/мин. Подтвердите физическое назначение после возврата BIOS/EC.");
+            candidate = proposal with { RangeVerified = true };
+            SetAction($"Тахометр: {Median(floor):0} об/мин при {proposal.Floor:0.#}% → {Median(after):0} об/мин при 100%. Подтвердите физическое назначение после возврата BIOS/EC.");
         }
-        else SetAction("Отклик не подтверждён: шум, недостаточно измерений или вентилятор уже на максимуме.");
+        else SetAction("Отклик не подтверждён. На 100% нужен устойчивый прирост оборотов относительно BIOS/EC и выбранного минимума.");
         BeginRestore();
     }
 
@@ -245,7 +255,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     static float Median(float[] data) => data.OrderBy(value => value).ElementAt(data.Length / 2);
     static bool Valid(Calibration value) => !string.IsNullOrWhiteSpace(value.Group) && value.Group.Length <= 48 &&
         !string.IsNullOrWhiteSpace(value.Topology) && value.Topology.Length <= 150 &&
-        value.Signal is SignalMode.Pwm or SignalMode.Dc && value.Floor is >= 40 and <= 100;
+        value.Signal is SignalMode.Pwm or SignalMode.Dc && value.Floor is >= 40 and < 100;
 
     public void SaveCalibration()
     {
@@ -261,8 +271,8 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     public void ConfirmUnchangedTopology()
     {
         conflict = conflictScan();
-        var saved = store.Saved;
-        if (!Idle || !HardwareReady || saved == null || !Valid(saved) || saved.Identity != sample?.Identity)
+        var saved = SavedBinding;
+        if (!Idle || !HardwareReady || saved == null || saved.Identity != sample?.Identity)
             throw new InvalidOperationException("Сохранённая привязка отсутствует или устарела. Нужна новая калибровка.");
         verified = saved;
         fault = null;
@@ -355,7 +365,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
         sourceLabel = null;
     }
 
-    void Write(float target, bool emergency = false)
+    float Write(float target, bool emergency = false)
     {
         SetAction($"Команда принята: {target:0}%.");
         float? duty = output.Write(target, () => Guard(emergency));
@@ -367,6 +377,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
         lastWrite = clock();
         LastWriteUtc = DateTimeOffset.UtcNow;
         SetAction($"Регистр команды подтвердил {target:0}%. Фактические обороты показывает отдельный тахометр.");
+        return measured;
     }
 
     void Guard(bool emergency)
