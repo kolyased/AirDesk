@@ -45,8 +45,10 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     public static readonly TimeSpan Freshness = TimeSpan.FromSeconds(4);
     public static readonly TimeSpan TestDuration = TimeSpan.FromSeconds(8);
     static readonly TimeSpan RestoreWindow = TimeSpan.FromSeconds(3);
+    static readonly TimeSpan IdleScanInterval = TimeSpan.FromMilliseconds(650);
     FanSample? sample;
     TimeSpan? lastPoll, lastWrite, testEnd, restoreAt;
+    TimeSpan? nextIdleScan;
     TimeSpan restoreDeadline;
     readonly Queue<float> baseline = new();
     readonly List<float> response = new();
@@ -167,10 +169,14 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
 
     public void Tick()
     {
-        string? detected = conflictScan();
-        if (detected != conflict) log(detected ?? "Известные конкурирующие процессы больше не обнаружены.");
-        conflict = detected;
-        if (conflict != null) baseline.Clear();
+        // Sensor polls and scheduled ticks can arrive together. Only idle ticks share a recent result.
+        if (captured != null || nextIdleScan is not { } due || clock() >= due)
+        {
+            string? previous = conflict;
+            RefreshConflict();
+            if (conflict != previous) log(conflict ?? "Известные конкурирующие процессы больше не обнаружены.");
+            nextIdleScan = captured == null ? clock() + IdleScanInterval : null;
+        }
         if (captured != null && !restoring)
         {
             if (closed || stopRequested()) Interrupt("Управление остановлено.", false);
@@ -193,9 +199,9 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
 
     public void BeginCalibration(Calibration proposal)
     {
-        conflict = conflictScan();
+        RefreshConflict();
         if (!CanCalibrate || proposal.Identity != sample!.Identity || !Valid(proposal) || proposal.Floor < Math.Ceiling(sample.Duty!.Value))
-            throw new InvalidOperationException("Калибровка недоступна. Нужны свежие показания CPU ниже 75 °C, стабильный тахометр и подтверждённое подключение. Минимум должен быть от 40% до значения ниже 100% и не ниже текущего выхода BIOS.");
+            throw new InvalidOperationException(conflict ?? "Калибровка недоступна. Нужны свежие показания CPU ниже 75 °C, стабильный тахометр и подтверждённое подключение. Минимум должен быть от 40% до значения ниже 100% и не ниже текущего выхода BIOS.");
         candidate = verified = null;
         response.Clear();
         floorSamples.Clear();
@@ -259,8 +265,9 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
 
     public void SaveCalibration()
     {
+        RefreshConflict();
         if (!Idle || candidate == null || candidate.Identity != sample?.Identity || restoreUncertain)
-            throw new InvalidOperationException("Нет завершённой калибровки с возвратом управления.");
+            throw new InvalidOperationException(conflict ?? "Нет завершённой калибровки с возвратом управления.");
         store.Save(candidate);
         verified = candidate;
         candidate = null;
@@ -270,10 +277,10 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
 
     public void ConfirmUnchangedTopology()
     {
-        conflict = conflictScan();
+        RefreshConflict();
         var saved = SavedBinding;
         if (!Idle || !HardwareReady || saved == null || saved.Identity != sample?.Identity)
-            throw new InvalidOperationException("Сохранённая привязка отсутствует или устарела. Нужна новая калибровка.");
+            throw new InvalidOperationException(conflict ?? "Сохранённая привязка отсутствует или устарела. Нужна новая калибровка.");
         verified = saved;
         fault = null;
         SetAction("Сохранённая привязка подтверждена для текущего запуска.");
@@ -281,8 +288,9 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
 
     public void Rename(string name)
     {
+        RefreshConflict();
         if (!View().CanRename || string.IsNullOrWhiteSpace(name) || name.Trim().Length > 48)
-            throw new InvalidOperationException("Название группы должно содержать от 1 до 48 символов.");
+            throw new InvalidOperationException(conflict ?? "Название группы должно содержать от 1 до 48 символов.");
         var renamed = verified! with { Group = name.Trim() };
         store.Save(renamed);
         verified = renamed;
@@ -291,7 +299,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
 
     public void Enable(FanProfile next)
     {
-        conflict = conflictScan();
+        RefreshConflict();
         if (!CanEnable) throw new InvalidOperationException(conflict ?? "Сначала подтвердите привязку и доступность датчиков.");
         ValidateProfile(next);
         try
@@ -382,11 +390,17 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
 
     void Guard(bool emergency)
     {
-        conflict = conflictScan();
+        RefreshConflict();
         if (conflict != null) throw new InvalidOperationException(conflict);
         if (closed || stopRequested() || restoring || testEnd is { } end && clock() >= end)
             throw new InvalidOperationException("Команда отменена или время теста истекло.");
         if (!emergency && !SafeCpu) throw new InvalidOperationException("Температура CPU недоступна или устарела.");
+    }
+
+    void RefreshConflict()
+    {
+        conflict = conflictScan();
+        if (conflict != null) baseline.Clear();
     }
 
     public void Interrupt(string reason, bool trySafeSpeed)
@@ -418,6 +432,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
 
     public void InvalidateForPowerChange()
     {
+        nextIdleScan = null;
         sample = null;
         lastPoll = null;
         LastPollUtc = null;
@@ -430,7 +445,8 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
 
     public void AcknowledgeRecovery()
     {
-        if (!View().CanRecover) throw new InvalidOperationException("Нельзя снять блокировку сейчас.");
+        RefreshConflict();
+        if (!View().CanRecover) throw new InvalidOperationException(conflict ?? "Нельзя снять блокировку сейчас.");
         store.ClearBinding();
         store.ClearCapture();
         verified = candidate = null;

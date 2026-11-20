@@ -52,7 +52,8 @@ public sealed partial class Dashboard : Window
         viewModel = new DashboardViewModel(autostart || monitorOnly,
             benchmark ? System.IO.Path.Combine(AppContext.BaseDirectory, "benchmark-history") : null);
         DataContext = viewModel;
-        viewModel.ConfigureHistory(benchmark ? recordHistory ? HistoryRetention.Hour : HistoryRetention.Off : preferences.Retention);
+        viewModel.ConfigureHistory(benchmark ? recordHistory ? HistoryRetention.Hour : HistoryRetention.Off : preferences.Retention,
+            benchmark ? null : preferences.HistorySensors);
         if (!benchmark) viewModel.ConfigureRules(preferences.Rules);
         AppTheme.Apply(preferences.Theme);
         Title = "AirDesk";

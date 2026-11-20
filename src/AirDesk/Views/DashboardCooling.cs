@@ -215,8 +215,14 @@ public sealed partial class Dashboard
     {
         var choices = new List<SourceOption> { new(null, defaultLabel) };
         choices.AddRange(sources.Select(source => new SourceOption(source.Source,
-            preferences.Label(source.Source.Id, FriendlySource(source.Label)) + (source.Celsius.HasValue ? "" : " · нет данных"))));
-        if (selectedSource != null && choices.All(choice => choice.Reference != selectedSource)) choices.Add(new(selectedSource, "Сохранённый датчик недоступен"));
+            preferences.Label(source.Source.Id, preferences.Label(source.ReadingId ?? source.Source.Id, FriendlySource(source.Label))) +
+            (source.Celsius.HasValue ? "" : " · нет данных"))));
+        if (selectedSource != null && choices.All(choice => choice.Reference != selectedSource))
+        {
+            string label = selectedSource.DeviceId?.StartsWith("/gpu-", StringComparison.Ordinal) == true
+                ? "Выберите датчик GPU заново" : "Сохранённый датчик недоступен";
+            choices.Add(new(selectedSource, label));
+        }
         box.ItemsSource = choices;
         box.SelectedItem = choices.First(choice => choice.Reference == selectedSource);
     }

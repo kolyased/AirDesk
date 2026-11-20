@@ -7,7 +7,7 @@ namespace AirDesk;
 public enum ProfileKind { Quiet, Balanced, Performance, Custom, Manual }
 public record CurvePoint(float Celsius, float Percent);
 public record SensorReference(string Id, string DeviceId, string DeviceName);
-public record TemperatureInput(SensorReference Source, string Label, float? Celsius);
+public record TemperatureInput(SensorReference Source, string Label, float? Celsius, string? ReadingId = null);
 public record FanProfile(ProfileKind Kind, float Manual, CurvePoint[] Custom, SensorReference? Primary, SensorReference? Secondary)
 {
     public static FanProfile Default => new(ProfileKind.Balanced, 100, Curve.DefaultPoints(ProfileKind.Balanced), null, null);

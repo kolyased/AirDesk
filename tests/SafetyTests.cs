@@ -274,11 +274,51 @@ public sealed class SafetyTests
     }
 
     [Fact]
+    public void RepeatedIdleTicksShareOneProcessScan()
+    {
+        var rig = new Rig();
+        rig.Safety.Tick();
+        rig.Conflict = "FanControl";
+        rig.Safety.Tick();
+        Assert.Equal(1, rig.ConflictScans);
+        Assert.Null(rig.Safety.View().Conflict);
+        rig.PassTime(.85);
+        rig.Safety.Tick();
+        Assert.Equal(2, rig.ConflictScans);
+        Assert.Equal("FanControl", rig.Safety.View().Conflict);
+    }
+
+    [Fact]
+    public void EnableRefreshesConflictAfterIdleScan()
+    {
+        var rig = new Rig(Profile);
+        rig.Safety.ConfirmUnchangedTopology();
+        rig.Safety.Tick();
+        rig.Conflict = "FanControl.Service";
+        Reject(() => rig.Safety.Enable(Manual));
+        Assert.Equal("FanControl.Service", rig.Safety.View().Conflict);
+        Assert.Empty(rig.Output.Writes);
+    }
+
+    [Fact]
+    public void RecoveryAcknowledgmentRefreshesConflictAfterIdleScan()
+    {
+        var rig = new Rig(Profile, recovery: true);
+        rig.Safety.Tick();
+        Assert.True(rig.Safety.View().CanRecover);
+        rig.Conflict = "FanControl.Service";
+        Reject(rig.Safety.AcknowledgeRecovery);
+        Assert.True(rig.Store.RecoveryPending);
+        Assert.False(rig.Safety.View().CanRecover);
+    }
+
+    [Fact]
     public void ConflictAtWriteGuardBlocksWrite()
     {
         var rig = new Rig(Profile);
         Reject(() => rig.Safety.Enable(Manual));
         rig.Safety.ConfirmUnchangedTopology();
+        rig.Safety.Tick();
         rig.Output.BeforeGuard = () => rig.Conflict = "FanControl.Service";
         Reject(() => rig.Safety.Enable(Manual));
         rig.Safety.Tick();
@@ -414,7 +454,7 @@ public sealed class SafetyTests
         var devices = new HashSet<(string, string)> { (first.DeviceId, first.Device) };
         var completed = first.UpdatedAt!.Value.AddSeconds(5);
         var late = Reading.MergePoll([first], [], devices, completed, TimeSpan.FromSeconds(4)).Single();
-        Check(late.Quality == ReadingQuality.Stale && !late.Available && new Telemetry([late]).CurveSources.Single().Celsius == null,
+        Check(late.Quality == ReadingQuality.Stale && !late.Available && new Telemetry([late with { DeviceInstance = @"PCI\VEN_10DE&DEV_2882\4&00001&0&0008" }]).CurveSources.Single().Celsius == null,
             "An old sample cannot drive a curve after a slow poll");
         var denied = Reading.MergePoll([first with { Value = null, UpdatedAt = null, Quality = ReadingQuality.AccessDenied }],
             [first], devices, completed, TimeSpan.FromSeconds(4)).Single();
@@ -446,14 +486,20 @@ public sealed class SafetyTests
     {
         TimeSpan time;
         public string? Conflict;
+        public int ConflictScans;
         public Output Output { get; } = new();
         public Store Store { get; }
         public CoolingSafety Safety { get; }
         public Rig(Calibration? saved = null, bool recovery = false)
         {
             Store = new() { Saved = saved, RecoveryPending = recovery };
-            Safety = new(Output, Store, () => Conflict, () => time, _ => { }, () => false);
+            Safety = new(Output, Store, Scan, () => time, _ => { }, () => false);
             if (saved != null) Seed();
+        }
+        string? Scan()
+        {
+            ConflictScans++;
+            return Conflict;
         }
         public static Rig Active()
         {

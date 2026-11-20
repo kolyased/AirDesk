@@ -7,8 +7,18 @@ public sealed class TelemetryAndFrameTests
 {
     [Theory]
     [InlineData("fan.control.service", "FanControl")]
+    [InlineData("FanControl.exe", "FanControl")]
+    [InlineData("FaNcOnTrOl.SeRvIcE.ExE", "FanControl")]
     [InlineData("MSIAfterburner", "MSI Afterburner")]
     [InlineData("asusfancontrolservice", "ASUS Fan Xpert / AI Suite")]
+    [InlineData("NZXT CAM.exe", "NZXT CAM")]
+    [InlineData("cam_helper.exe", "NZXT CAM")]
+    [InlineData("Corsair.Service.exe", "Corsair iCUE")]
+    [InlineData("FanControlUpdater", null)]
+    [InlineData("FanControlProfileEditor.exe", null)]
+    [InlineData("MSIAfterburnerHelper", null)]
+    [InlineData("ArgusMonitorSetup", null)]
+    [InlineData("OtherCam_Helper.exe", null)]
     [InlineData("explorer", null)]
     public void ControllerRecognitionUsesProcessName(string process, string? expected)
     {

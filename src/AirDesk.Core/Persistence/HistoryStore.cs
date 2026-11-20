@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -10,18 +9,19 @@ namespace AirDesk;
 
 internal sealed class HistoryStore
 {
-    sealed record Journal(int Version, HistoryPoint[] Points);
-
-    readonly string path;
-    readonly List<HistoryPoint> points = new();
+    readonly string path, legacyPath;
+    HistoryPoint[] archive = [];
+    readonly List<HistoryPoint> pending = new();
     readonly Dictionary<SensorReference, DateTimeOffset> observed = new();
     readonly object gate = new();
     readonly SemaphoreSlim disk = new(1, 1);
     readonly Task loading;
     DateTimeOffset lastSample, lastFlush = DateTimeOffset.UtcNow;
     HistoryRetention retention;
-    int revision, savedRevision;
-    bool stopped;
+    HashSet<SensorReference>? sensors;
+    long removedPending;
+    int revision;
+    bool stopped, legacyLoaded;
     bool invalidOnLoad;
     volatile string? error;
     public string? Error => error;
@@ -30,7 +30,9 @@ internal sealed class HistoryStore
 
     public HistoryStore(string? folder = null)
     {
-        path = Path.Combine(folder ?? AtomicJson.Folder, "history-v1.json");
+        folder ??= AtomicJson.Folder;
+        path = Path.Combine(folder, "history-v2.json.gz");
+        legacyPath = Path.Combine(folder, "history-v1.json");
         loading = Task.Run(Load);
     }
 
@@ -38,31 +40,39 @@ internal sealed class HistoryStore
     {
         try
         {
-            var info = new FileInfo(path);
-            if (!info.Exists) return;
-            if (info.Length > HistoryModel.MaxBytes) throw new InvalidDataException("Файл истории превышает лимит.");
-            var document = JsonSerializer.Deserialize<Journal>(File.ReadAllBytes(path));
-            if (document?.Version != 1 || document.Points == null) throw new InvalidDataException("Неизвестный формат истории.");
+            HistoryPoint[] rows;
+            if (File.Exists(path)) rows = HistoryJournal.Read(path);
+            else if (File.Exists(legacyPath))
+            {
+                rows = HistoryJournal.ReadLegacy(legacyPath);
+                legacyLoaded = true;
+            }
+            else return;
             lock (gate)
             {
-                points.AddRange(document.Points.Where(point => point?.Valid == true).OrderBy(point => point.At).TakeLast(HistoryModel.MaxPoints));
+                archive = rows.Where(point => point?.Valid == true).OrderBy(point => point.At).TakeLast(HistoryModel.MaxPoints).ToArray();
+                foreach (var point in archive) observed[point.Sensor] = point.At;
                 revision++;
-                savedRevision = retention == HistoryRetention.Off ? revision : revision - 1;
             }
         }
         catch (Exception failure) { invalidOnLoad = true; Fail(failure); }
     }
 
-    public void Configure(HistoryRetention value)
+    public void Configure(HistoryRetention value, IEnumerable<SensorReference>? selection = null)
     {
+        bool retentionChanged;
+        var next = selection?.ToHashSet();
         lock (gate)
         {
-            if (retention == value) return;
+            retentionChanged = retention != value;
+            bool sameSensors = sensors == null ? next == null : next != null && sensors.SetEquals(next);
+            if (!retentionChanged && sameSensors) return;
             retention = value;
+            sensors = next;
             lastSample = default;
-            if (value != HistoryRetention.Off) revision++;
+            revision++;
         }
-        if (value != HistoryRetention.Off) _ = FlushAsync();
+        if (retentionChanged) _ = FlushAsync();
     }
 
     public void Offer(Telemetry telemetry, DateTimeOffset now)
@@ -75,29 +85,37 @@ internal sealed class HistoryStore
             if (stopped || interval == 0 || now >= lastSample && now - lastSample < TimeSpan.FromSeconds(interval)) return;
             lastSample = now;
             if (observed.Count > 256)
-                foreach (var key in observed.Keys.Where(key => telemetry.Find(key) == null).ToArray()) observed.Remove(key);
-            foreach (var reading in telemetry.HistorySources.Take(32))
             {
+                var converted = telemetry.HistoryCandidates.Select(telemetry.PersistentReference).ToHashSet();
+                foreach (var key in observed.Keys.Where(key => telemetry.Find(key) == null && !converted.Contains(key)).ToArray()) observed.Remove(key);
+            }
+            var sources = sensors == null ? telemetry.HistorySources : telemetry.HistoryCandidates;
+            foreach (var reading in sources)
+            {
+                var sensor = sensors == null ? reading.Reference : telemetry.PersistentReference(reading);
+                if (sensors != null && !sensors.Contains(sensor)) continue;
                 if (reading is not { Available: true, Value: float value, UpdatedAt: { } time } ||
-                    observed.TryGetValue(reading.Reference, out var old) && time <= old) continue;
-                observed[reading.Reference] = time;
-                points.Add(new(reading.Reference, reading.Name, reading.Unit, time, time, value, value, value, 1, interval));
+                    !float.IsFinite(value) || time > now.AddMinutes(1) ||
+                    observed.TryGetValue(sensor, out var old) && time <= old) continue;
+                observed[sensor] = time;
+                pending.Add(new(sensor, reading.Name, reading.Unit, time, time, value, value, value, 1, interval));
                 revision++;
             }
-            if (points.Count > HistoryModel.MaxPoints + 512)
-                points.RemoveRange(0, points.Count - HistoryModel.MaxPoints);
-            if (now - lastFlush >= TimeSpan.FromMinutes(1)) { lastFlush = now; flush = true; }
+            DiscardPending(Math.Max(0, pending.Count - HistoryModel.MaxPoints));
+            var flushInterval = TimeSpan.FromMinutes(retention is HistoryRetention.Week or HistoryRetention.Month ? 5 : 1);
+            if (now < lastFlush || now - lastFlush >= flushInterval) { lastFlush = now; flush = true; }
         }
         if (flush) _ = FlushAsync();
     }
 
     public HistoryPoint[] Read()
     {
-        lock (gate) return points.ToArray();
+        lock (gate) return [.. archive, .. pending];
     }
 
     public async Task<HistoryPoint[]> ReadAsync() { await loading.ConfigureAwait(false); return Read(); }
-    public bool OwnsPath(string candidate) => Path.GetFullPath(candidate).Equals(Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase);
+    public bool OwnsPath(string candidate) => new[] { path, legacyPath }.Any(owned =>
+        Path.GetFullPath(candidate).Equals(Path.GetFullPath(owned), StringComparison.OrdinalIgnoreCase));
 
     public async Task FlushAsync()
     {
@@ -106,37 +124,53 @@ internal sealed class HistoryStore
         await disk.WaitAsync().ConfigureAwait(false);
         try
         {
-            await Task.Run(() =>
-            {
-                HistoryPoint[] current;
-                HistoryRetention strategy;
-                int snapshot;
-                lock (gate)
-                {
-                    if (savedRevision == revision) return;
-                    current = points.ToArray();
-                    strategy = retention;
-                    snapshot = revision;
-                }
-                var compact = HistoryModel.Compact(current, DateTimeOffset.UtcNow, strategy == HistoryRetention.Off ? HistoryRetention.Month : strategy);
-                while (JsonSerializer.SerializeToUtf8Bytes(new Journal(1, compact)).Length > HistoryModel.MaxBytes)
-                    compact = compact.Skip(Math.Max(1, compact.Length / 10)).ToArray();
-                AtomicJson.Write(path, new Journal(1, compact));
-                lock (gate)
-                {
-                    if (snapshot == revision)
-                    {
-                        points.Clear(); points.AddRange(compact);
-                        revision++;
-                        savedRevision = revision;
-                    }
-                    else savedRevision = snapshot;
-                }
-                error = null;
-            }).ConfigureAwait(false);
+            await Task.Run(Flush).ConfigureAwait(false);
         }
         catch (Exception failure) { Fail(failure); }
         finally { disk.Release(); }
+    }
+
+    void Flush()
+    {
+        HistoryPoint[] current;
+        HistoryRetention strategy;
+        long endOfBatch;
+        var now = DateTimeOffset.UtcNow;
+        lock (gate)
+        {
+            strategy = retention;
+            var cutoff = now - HistoryModel.Period(strategy);
+            bool rotate = strategy != HistoryRetention.Off && archive.Any(point => point.From < cutoff);
+            if (pending.Count == 0 && !rotate && !(legacyLoaded && strategy != HistoryRetention.Off)) return;
+            current = [.. archive, .. pending];
+            endOfBatch = removedPending + pending.Count;
+        }
+        var compact = strategy == HistoryRetention.Off
+            ? current.Where(point => point.Valid).OrderBy(point => point.At).TakeLast(HistoryModel.MaxPoints).ToArray()
+            : HistoryModel.Compact(current, now, strategy);
+        using var encoded = new MemoryStream();
+        while (!HistoryJournal.TryEncode(compact, encoded))
+            compact = compact.Skip(Math.Max(1, compact.Length / 10)).ToArray();
+        AtomicJson.WriteFile(path, stream => encoded.CopyTo(stream));
+        lock (gate)
+        {
+            archive = compact;
+            DiscardPending((int)Math.Clamp(endOfBatch - removedPending, 0, pending.Count));
+            revision++;
+            error = null;
+        }
+        if (legacyLoaded)
+        {
+            File.Delete(legacyPath);
+            legacyLoaded = false;
+        }
+    }
+
+    void DiscardPending(int count)
+    {
+        if (count == 0) return;
+        pending.RemoveRange(0, count);
+        removedPending += count;
     }
 
     public async Task ClearAsync()
@@ -150,10 +184,11 @@ internal sealed class HistoryStore
             {
                 lock (gate)
                 {
+                    File.Delete(legacyPath);
                     File.Delete(path);
-                    points.Clear(); observed.Clear();
+                    legacyLoaded = false;
+                    archive = []; pending.Clear(); observed.Clear();
                     revision++;
-                    savedRevision = revision;
                     lastSample = DateTimeOffset.UtcNow;
                 }
                 error = null;
@@ -168,5 +203,13 @@ internal sealed class HistoryStore
         return FlushAsync();
     }
 
-    void Fail(Exception failure) { error = failure.Message; DiagnosticLog.Write(failure.ToString()); }
+    void Fail(Exception failure)
+    {
+        lock (gate)
+        {
+            if (error != failure.Message) revision++;
+            error = failure.Message;
+        }
+        DiagnosticLog.Write(failure.ToString());
+    }
 }

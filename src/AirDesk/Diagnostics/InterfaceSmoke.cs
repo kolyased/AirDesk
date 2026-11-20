@@ -46,6 +46,7 @@ public sealed partial class Dashboard
         SaveImage(this, "history", 96);
         if (viewModel.History.Retention != HistoryRetention.Off && visibleHistory.Length == 0)
             throw new InvalidOperationException("Recording was enabled, but the history view has no readings.");
+        VerifyGpuSelection();
         await VerifyPowerTransitionAsync();
         var work = Forms.Screen.PrimaryScreen!.WorkingArea;
         flyoutAnchor = new System.Drawing.Point(work.Right - 12, work.Bottom);
@@ -73,6 +74,47 @@ public sealed partial class Dashboard
         }
         finally { DisposeFrames(); File.Delete(frameFixture); }
         File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "ui-smoke.json"), JsonSerializer.Serialize(results));
+    }
+
+    void VerifyGpuSelection()
+    {
+        const string first = @"PCI\VEN_10DE&DEV_2882\4&00001&0&0008";
+        const string second = @"PCI\VEN_10DE&DEV_2882\4&00002&0&0008";
+        var previous = (displayed, preferences.Gpu, preferences.GpuInstance, preferences.GpuName);
+        try
+        {
+            Navigate(DevicesTab);
+            var initial = new Telemetry([Gpu(0, 42, first), Gpu(1, 65, second)]);
+            Show(initial);
+            var options = (DeviceOption[])gpuChoice.ItemsSource;
+            if (options.Length != 3 || options[1].Label == options[2].Label)
+                throw new InvalidOperationException("The selector did not distinguish identical graphics cards.");
+            gpuChoice.SelectedItem = options[2];
+            if (preferences.GpuInstance != second)
+                throw new InvalidOperationException("The selected graphics card was not saved by device instance.");
+            Show(new Telemetry([Gpu(0, 66, second), Gpu(1, 43, first)]));
+            if (gpuChoice.SelectedItem is not DeviceOption { Id: "/gpu-nvidia/0", InstanceId: second })
+                throw new InvalidOperationException("The selected graphics card changed after adapter reordering.");
+            Show(new Telemetry([Gpu(1, 43, first)]));
+            if (gpuChoice.SelectedItem is not DeviceOption { Missing: true })
+                throw new InvalidOperationException("The selected graphics card was silently replaced after disconnect.");
+        }
+        finally
+        {
+            (displayed, preferences.Gpu, preferences.GpuInstance, preferences.GpuName) = previous;
+            preferences.Save();
+            if (displayed is { } current) RenderTelemetry(current, previousStale, false);
+        }
+
+        void Show(Telemetry data)
+        {
+            displayed = data;
+            RenderTelemetry(data, stale: false, newData: false);
+        }
+
+        static Reading Gpu(int index, float temperature, string instance) => new("Example GPU", $"/gpu-nvidia/{index}",
+            "GpuNvidia", "GPU Core", "Temperature", "°C", temperature, $"/gpu-nvidia/{index}/temperature/0", ReadingQuality.Fresh,
+            DateTimeOffset.UtcNow) { DeviceInstance = instance };
     }
 
     async Task VerifyPowerTransitionAsync()

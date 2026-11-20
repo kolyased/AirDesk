@@ -18,8 +18,12 @@ public sealed partial class Dashboard
     readonly DataGridTextColumn deviceSection = new() { Header = "Раздел", Binding = new Binding("Section"), Width = 145 };
     readonly TextBlock detailTitle = Text("", 14), diagnosticStatus = Text("", 12);
     bool previousStale, updatingDeviceChoices;
-    record DeviceOption(string Id, string Label) { public override string ToString() => Label; }
-    record ReadingRow(string? Key, string Name, string Value, string Quality, string Time, string Original, string Source, string Section = "")
+    record DeviceOption(string? Id, string Label, string? InstanceId = null, bool Missing = false)
+    {
+        public override string ToString() => Label;
+    }
+    record ReadingRow(string? Key, string Name, string Value, string Quality, string Time, string Original, string Source,
+        string Section = "", string? AliasKey = null)
     {
         public string Hint => $"Исходное имя: {Original}\nИсточник: {Source}\nКачество: {Quality}" + (Key == null ? "" : $"\nID: {Key}");
     }
@@ -32,7 +36,7 @@ public sealed partial class Dashboard
         NameForAutomation(deviceChoice, "Устройство для подробного просмотра");
         NameForAutomation(gpuChoice, "Видеокарта на вкладке обзора");
         controls.Children.Add(deviceChoice);
-        controls.Children.Add(Button("Переименовать устройство", () => { if (deviceChoice.SelectedItem is DeviceOption option) Alias(option.Id, option.Label); }));
+        controls.Children.Add(Button("Переименовать устройство", RenameDevice));
         controls.Children.Add(Button("Переименовать датчик", () => RenameReading(deviceTable)));
         var gpuRow = new WrapPanel(); head.Children.Add(gpuRow);
         gpuRow.Children.Add(Text("Видеокарта в обзоре    ", 14)); gpuRow.Children.Add(gpuChoice);
@@ -40,10 +44,10 @@ public sealed partial class Dashboard
         deviceChoice.SelectionChanged += (_, _) => { if (!updatingDeviceChoices) RefreshDevice(); };
         gpuChoice.SelectionChanged += (_, _) =>
         {
-            if (updatingDeviceChoices || gpuChoice.SelectedItem is not DeviceOption option) return;
-            preferences.Gpu = option.Id;
-            SavePreference();
-            if (displayed != null) RenderTelemetry(displayed, previousStale, false);
+            if (updatingDeviceChoices || displayed is not { } data || gpuChoice.SelectedItem is not DeviceOption { Missing: false } option) return;
+            try { preferences.SelectGpu(option.Id == null ? null : data.PrimaryGpu(option.Id, option.InstanceId)); }
+            catch (Exception error) { ShowPreferenceError(error); }
+            RenderTelemetry(data, previousStale, false);
         };
         ConfigureReadings(deviceTable, false); panel.Children.Add(deviceTable);
         deviceTable.Columns.Insert(0, deviceSection);
@@ -87,12 +91,13 @@ public sealed partial class Dashboard
 
     void RenderTelemetry(Telemetry data, bool stale, bool newData)
     {
-        var gpu = data.PrimaryGpu(preferences.Gpu);
+        var gpu = preferences.SelectedGpu(data);
         float? Read(Reading? reading) => !stale && reading?.Available == true ? reading.Value : null;
         float? load = Read(data.Cpu?.Load);
         viewModel.Cpu.Set(Format(load, "%"), ValueStatus(data.Cpu?.Temperature, stale, "°C"));
-        viewModel.Gpu.Set(Format(Read(gpu?.Load), "%"), ValueStatus(gpu?.Temperature, stale, "°C") +
-            (gpu == null ? "" : " · " + preferences.Label(gpu.Id, gpu.Name)));
+        string gpuStatus = gpu == null && preferences.Gpu != null ? "Выбранная видеокарта недоступна" : ValueStatus(gpu?.Temperature, stale, "°C");
+        viewModel.Gpu.Set(Format(Read(gpu?.Load), "%"), gpuStatus +
+            (gpu == null ? "" : " · " + preferences.DeviceLabel(gpu.Id, gpu.Name, gpu.InstanceId)));
         viewModel.Memory.Set(Format(Read(data.Ram?.Load), "%"), Read(data.Ram?.MemoryUsed) is float used && data.Ram?.MemoryTotal is float total
             ? $"{used:0.#} / {total:0.#} ГБ" : "Физическая память");
         var hottestDisk = data.Disks.Where(disk => Read(disk.Temperature).HasValue).MaxBy(disk => Read(disk.Temperature));
@@ -112,8 +117,8 @@ public sealed partial class Dashboard
         cards[OverviewCard.Storage].ToolTip = CardHint("Активность", data.Disks.Select(device => device.Load).Where(reading => reading?.Available == true)
             .MaxBy(reading => reading?.Value), "Температура", hottestDisk?.Temperature, stale);
         var newSources = data.CurveSources.Select(source => stale ? source with { Celsius = null } : source).ToArray();
-        if (!sources.Select(source => (source.Source, source.Label, source.Celsius.HasValue))
-            .SequenceEqual(newSources.Select(source => (source.Source, source.Label, source.Celsius.HasValue))))
+        if (!sources.Select(source => (source.Source, source.ReadingId, source.Label, source.Celsius.HasValue))
+            .SequenceEqual(newSources.Select(source => (source.Source, source.ReadingId, source.Label, source.Celsius.HasValue))))
         {
             sources = newSources;
             SetProfileFields();
@@ -133,24 +138,60 @@ public sealed partial class Dashboard
     void UpdateDevices(Telemetry data)
     {
         updatingDeviceChoices = true;
-        ReplaceOptions(deviceChoice, data.Devices, (deviceChoice.SelectedItem as DeviceOption)?.Id);
-        ReplaceOptions(gpuChoice, data.Gpus, preferences.Gpu);
-        updatingDeviceChoices = false;
+        try
+        {
+            var details = DeviceOptions(data.Devices);
+            var previous = deviceChoice.SelectedItem as DeviceOption;
+            var detailItem = previous?.InstanceId is { } instance
+                ? details.FirstOrDefault(option => option.InstanceId == instance)
+                : details.FirstOrDefault(option => option.Id == previous?.Id);
+            ReplaceOptions(deviceChoice, details, detailItem ?? details.FirstOrDefault());
+
+            DeviceOption automatic = new(null, "Автоматически");
+            DeviceOption[] options = [automatic, .. DeviceOptions(data.Gpus)];
+            DeviceOption gpuItem = automatic;
+            if (preferences.Gpu is { } id)
+            {
+                if (preferences.SelectedGpu(data) is { } gpu) gpuItem = options.First(option => option.Id == gpu.Id);
+                else
+                {
+                    gpuItem = new(id, $"{preferences.GpuName ?? id} · недоступна", preferences.GpuInstance, Missing: true);
+                    options = [.. options, gpuItem];
+                }
+            }
+            ReplaceOptions(gpuChoice, options, gpuItem);
+        }
+        finally { updatingDeviceChoices = false; }
     }
 
-    void ReplaceOptions(ComboBox box, DeviceReadings[] devices, string? selectedId)
+    DeviceOption[] DeviceOptions(DeviceReadings[] devices)
     {
-        var options = devices.Select(device => new DeviceOption(device.Id, preferences.Label(device.Id, device.Name))).ToArray();
-        if (box.ItemsSource is DeviceOption[] previous && previous.SequenceEqual(options)) return;
+        var names = devices.ToLookup(device => device.Name, StringComparer.CurrentCultureIgnoreCase);
+        var labels = devices.ToLookup(device => preferences.DeviceLabel(device.Id, device.Name, device.InstanceId), StringComparer.CurrentCultureIgnoreCase);
+        return devices.Select(device =>
+        {
+            string label = preferences.DeviceLabel(device.Id, device.Name, device.InstanceId);
+            if (labels[label].Count() > 1 || names[device.Name].Count() > 1) label = $"{label} ({device.Id})";
+            return new DeviceOption(device.Id, label, device.InstanceId);
+        }).ToArray();
+    }
+
+    static void ReplaceOptions(ComboBox box, DeviceOption[] options, DeviceOption? selected)
+    {
+        if (box.ItemsSource is DeviceOption[] previous && previous.SequenceEqual(options))
+        {
+            box.SelectedItem = previous.FirstOrDefault(option => option == selected);
+            return;
+        }
         box.ItemsSource = options;
-        box.SelectedItem = options.FirstOrDefault(item => item.Id == selectedId) ?? options.FirstOrDefault();
+        box.SelectedItem = selected;
     }
 
     void RefreshDevice()
     {
         var item = displayed?.Devices.FirstOrDefault(device => device.Id == (deviceChoice.SelectedItem as DeviceOption)?.Id);
-        if (item == null) { deviceTable.ItemsSource = null; return; }
-        detailTitle.Text = $"{preferences.Label(item.Id, item.Name)}   ·   {item.Id}";
+        if (item == null) { detailTitle.Text = ""; deviceTable.ItemsSource = null; return; }
+        detailTitle.Text = $"{preferences.DeviceLabel(item.Id, item.Name, item.InstanceId)}   ·   {item.Id}";
         deviceSection.Visibility = item.Type is "SuperIO" or "Motherboard" ? Visibility.Visible : Visibility.Collapsed;
         var rows = item.Details().Select(metric => metric.Reading == null
             ? new ReadingRow(null, metric.Label, previousStale ? "—" : Format(metric.Derived, metric.Unit),
@@ -195,9 +236,10 @@ public sealed partial class Dashboard
     {
         ReadingQuality quality = previousStale && reading.Quality is ReadingQuality.Fresh or ReadingQuality.Unverified ? ReadingQuality.Stale : reading.Quality;
         bool visible = raw || quality is ReadingQuality.Fresh or ReadingQuality.Unverified;
-        return new(reading.Id, preferences.Label(reading.Id, label), Format(visible ? reading.Value : null, reading.Unit),
+        string aliasKey = displayed?.PersistentReference(reading).Id ?? reading.Id;
+        return new(reading.Id, preferences.Label(aliasKey, preferences.Label(reading.Id, label)), Format(visible ? reading.Value : null, reading.Unit),
             QualityText(quality), reading.UpdatedAt?.ToLocalTime().ToString("HH:mm:ss") ?? "—",
-            reading.Name, raw ? $"{reading.Source} · {reading.Id}" : reading.Source);
+            reading.Name, raw ? $"{reading.Source} · {reading.Id}" : reading.Source, AliasKey: aliasKey);
     }
 
     static string ValueStatus(Reading? reading, bool stale, string unit) => stale ? "Данные устарели" :
@@ -212,16 +254,21 @@ public sealed partial class Dashboard
 
     void RenameReading(DataGrid table)
     {
-        if (table.SelectedItem is ReadingRow { Key: { } key } row) Alias(key, row.Name);
+        if (table.SelectedItem is ReadingRow { Key: { } key } row) Alias(row.AliasKey ?? key, row.Name, key);
     }
 
-    void Alias(string key, string old)
+    void RenameDevice()
+    {
+        if (deviceChoice.SelectedItem is not DeviceOption { Id: { } id } || displayed?.Devices.FirstOrDefault(device => device.Id == id) is not { } device) return;
+        Alias(UserPreferences.DeviceAliasKey(id, device.InstanceId), preferences.DeviceLabel(id, device.Name, device.InstanceId), id);
+    }
+
+    void Alias(string key, string old, string? legacyKey = null)
     {
         string? name = Prompt("Отображаемое имя (пустое поле сбрасывает)", old, 60);
         if (name == null) return;
-        if (name.Length == 0) preferences.Aliases.Remove(key);
-        else preferences.Aliases[key] = name;
-        SavePreference();
+        try { preferences.SetAlias(key, name, legacyKey); }
+        catch (Exception error) { ShowPreferenceError(error); return; }
         if (displayed != null) RenderTelemetry(displayed, previousStale, false);
         SetProfileFields();
     }
@@ -229,7 +276,13 @@ public sealed partial class Dashboard
     void SavePreference()
     {
         try { preferences.Save(); }
-        catch (Exception error) { Monitor.Log(error); MessageBox.Show(this, "Не удалось сохранить настройки: " + error.Message, "AirDesk"); }
+        catch (Exception error) { ShowPreferenceError(error); }
+    }
+
+    void ShowPreferenceError(Exception error)
+    {
+        Monitor.Log(error);
+        MessageBox.Show(this, "Не удалось сохранить настройки: " + error.Message, "AirDesk");
     }
 
     string ReportText() => JsonSerializer.Serialize(new

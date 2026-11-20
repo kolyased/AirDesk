@@ -127,7 +127,7 @@ public sealed partial class Dashboard
 
     void RenderTray(Telemetry data, CoolingView cooling, bool stale)
     {
-        var gpu = data.Gpus.FirstOrDefault(item => item.Id == preferences.Gpu) ?? data.Gpus.FirstOrDefault();
+        var gpu = preferences.SelectedGpu(data);
         float? Value(Reading? reading) => !stale && reading?.Available == true ? reading.Value : null;
         float? cpuTemp = Value(data.Cpu?.Temperature), cpuLoad = Value(data.Cpu?.Load), gpuTemp = Value(gpu?.Temperature), gpuLoad = Value(gpu?.Load),
             ramLoad = Value(data.Ram?.Load), rpm = stale ? null : cooling.Rpm;

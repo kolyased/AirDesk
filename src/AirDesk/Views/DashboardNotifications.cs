@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
@@ -24,18 +25,27 @@ public sealed partial class Dashboard
     {
         var panel = new StackPanel();
         panel.Children.Add(Text("История и уведомления", 19));
-        AddWrapped(panel, "История хранится локально. Лимит файла — 4 МиБ. При достижении лимита самые старые записи удаляются. Выключение записи сохраняет уже собранную историю.");
+        AddWrapped(panel, "История хранится локально. При лимите 16 МиБ или 96 000 записей удаляются самые старые данные. Выключение записи сохраняет уже собранную историю.");
+        settingsHistoryRecorded.TextWrapping = TextWrapping.Wrap;
+        settingsHistoryRecorded.IsVisibleChanged += (_, _) => { if (settingsHistoryRecorded.IsVisible) RefreshHistory(force: true); };
+        panel.Children.Add(settingsHistoryRecorded);
+        panel.Children.Add(Text("Срок хранения", 13));
         var retention = new ComboBox { ItemsSource = new[] { "Выключено", "1 час", "1 день", "7 дней", "30 дней" },
-            SelectedIndex = (int)preferences.Retention, Width = 130, HorizontalAlignment = HorizontalAlignment.Left, Margin = new(0, 3, 0, 12) };
+            SelectedIndex = (int)preferences.Retention, Width = 130, HorizontalAlignment = HorizontalAlignment.Left, Margin = new(0, 3, 0, 6) };
         NameForAutomation(retention, "Срок хранения истории");
         retention.SelectionChanged += (_, _) =>
         {
-            if (retention.SelectedIndex < 0) return;
-            preferences.Retention = (HistoryRetention)retention.SelectedIndex;
-            viewModel.ConfigureHistory(preferences.Retention);
-            SavePreference();
+            if (retention.SelectedIndex < 0 || retention.SelectedIndex == (int)preferences.Retention) return;
+            if (!SaveHistorySettings((HistoryRetention)retention.SelectedIndex, preferences.HistorySensors))
+                retention.SelectedIndex = (int)preferences.Retention;
         };
         panel.Children.Add(retention);
+        historySelectionInfo.TextWrapping = TextWrapping.Wrap;
+        UpdateHistorySelectionInfo();
+        panel.Children.Add(historySelectionInfo);
+        var sensorSettings = Button("Датчики записи…", EditHistorySensors);
+        sensorSettings.HorizontalAlignment = HorizontalAlignment.Left;
+        panel.Children.Add(sensorSettings);
         panel.Children.Add(Text("Пороговые уведомления", 15));
         NameForAutomation(thresholdList, "Правила уведомлений");
         panel.Children.Add(thresholdList); LoadRuleChoices();
@@ -50,6 +60,89 @@ public sealed partial class Dashboard
         panel.Children.Add(notificationLog);
         AddWrapped(panel, "Пороговые правила управляют только уведомлениями. Возврат BIOS/EC и предупреждения охлаждения действуют независимо от этих правил.");
         return Surface(panel, new Thickness(14), new Thickness(0, 0, 0, 12));
+    }
+
+    void UpdateHistorySelectionInfo() => historySelectionInfo.Text = preferences.HistorySensors switch
+    {
+        null => "Датчики записи: по умолчанию",
+        { Length: 0 } => "Датчики записи: не выбраны",
+        var selection => $"Датчики записи: выбрано {selection.Length:N0}"
+    };
+
+    bool SaveHistorySettings(HistoryRetention retention, SensorReference[]? selection)
+    {
+        var previousRetention = preferences.Retention;
+        var previousSelection = preferences.HistorySensors;
+        preferences.Retention = retention;
+        preferences.HistorySensors = selection;
+        try { preferences.Save(); }
+        catch (Exception error)
+        {
+            preferences.Retention = previousRetention;
+            preferences.HistorySensors = previousSelection;
+            Monitor.Log(error);
+            MessageBox.Show(this, "Не удалось сохранить настройки истории: " + error.Message);
+            return false;
+        }
+        viewModel.ConfigureHistory(retention, selection);
+        UpdateHistorySelectionInfo();
+        RefreshHistory(force: true);
+        return true;
+    }
+
+    void EditHistorySensors()
+    {
+        var telemetry = latest?.Telemetry ?? Telemetry.Empty;
+        var selection = (preferences.HistorySensors ?? telemetry.HistorySources.Select(telemetry.PersistentReference).ToArray()).ToHashSet();
+        var labels = telemetry.HistoryCandidates.ToDictionary(telemetry.PersistentReference, reading =>
+            HistorySensorLabel(telemetry.PersistentReference(reading), reading.Name, reading.Unit, reading.DeviceInstance) +
+            (reading.Available ? "" : " · нет показаний"));
+        foreach (var sensor in selection)
+            labels.TryAdd(sensor, HistorySensorLabel(sensor, sensor.Id, "", null) + " · не обнаружен");
+        var duplicates = labels.Values.GroupBy(label => label).Where(group => group.Count() > 1).Select(group => group.Key).ToHashSet();
+        var window = Dialog("Датчики записи истории", 650, 570, out var panel);
+        if (labels.Count == 0) AddWrapped(panel, "Датчики ещё не обнаружены. Список появится после опроса оборудования.");
+        var list = new StackPanel();
+        var checkboxes = new List<CheckBox>();
+        var search = Field(panel, "Поиск по датчикам", "", 120);
+        foreach (var item in labels.OrderBy(item => item.Value, StringComparer.CurrentCulture).ThenBy(item => item.Key.Id, StringComparer.Ordinal))
+        {
+            string label = duplicates.Contains(item.Value) ? $"{item.Value} · {item.Key.Id}" : item.Value;
+            var checkbox = new CheckBox { Content = new TextBlock { Text = label, TextWrapping = TextWrapping.Wrap },
+                IsChecked = selection.Contains(item.Key), Tag = item.Key, ToolTip = item.Key.Id, Margin = new(0, 0, 0, 6) };
+            NameForAutomation(checkbox, label);
+            checkboxes.Add(checkbox);
+            list.Children.Add(checkbox);
+        }
+        search.TextChanged += (_, _) =>
+        {
+            foreach (var checkbox in checkboxes)
+                checkbox.Visibility = ((TextBlock)checkbox.Content).Text.Contains(search.Text.Trim(), StringComparison.CurrentCultureIgnoreCase)
+                    ? Visibility.Visible : Visibility.Collapsed;
+        };
+        var scroll = Scroll(list);
+        scroll.Height = 330; scroll.Margin = new(0, 4, 0, 10);
+        panel.Children.Add(scroll);
+        var actions = new WrapPanel();
+        panel.Children.Add(actions);
+        actions.Children.Add(Button("Выбрать видимые", () => SetVisible(true)));
+        actions.Children.Add(Button("Снять видимые", () => SetVisible(false)));
+        actions.Children.Add(Button("По умолчанию", () =>
+        {
+            if (SaveHistorySettings(preferences.Retention, null)) window.DialogResult = true;
+        }));
+        panel.Children.Add(Button("Сохранить выбор", () =>
+        {
+            var selected = checkboxes.Where(item => item.IsChecked == true).Select(item => (SensorReference)item.Tag).ToArray();
+            if (SaveHistorySettings(preferences.Retention, selected)) window.DialogResult = true;
+        }));
+        window.ShowDialog();
+
+        void SetVisible(bool enabled)
+        {
+            foreach (var checkbox in checkboxes.Where(item => item.Visibility == Visibility.Visible))
+                checkbox.IsChecked = enabled;
+        }
     }
 
     void LoadRuleChoices()

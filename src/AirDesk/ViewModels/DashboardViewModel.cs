@@ -51,7 +51,7 @@ internal sealed class DashboardViewModel
         };
     }
 
-    public void ConfigureHistory(HistoryRetention retention) => History.Configure(retention);
+    public void ConfigureHistory(HistoryRetention retention, IEnumerable<SensorReference>? sensors = null) => History.Configure(retention, sensors);
     public void ConfigureRules(ThresholdRule[] definitions) => rules = definitions;
     public string[] TakeAlerts()
     {

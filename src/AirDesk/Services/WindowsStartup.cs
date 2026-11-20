@@ -15,7 +15,7 @@ internal static class WindowsStartup
     public static string? Read()
     {
         using var key = Registry.CurrentUser.OpenSubKey(RunKey);
-        return key?.GetValue(Name) as string;
+        return Read(key);
     }
 
     public static void Set(bool enabled)
@@ -23,12 +23,22 @@ internal static class WindowsStartup
         if (!enabled)
         {
             using var existing = Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
-            existing?.DeleteValue(Name, throwOnMissingValue: false);
+            RemoveOwned(existing, Command);
             return;
         }
         string command = Command ?? throw new InvalidOperationException("Откройте AirDesk.exe, чтобы настроить автозапуск.");
         if (command.Length > 260) throw new InvalidOperationException("Путь к AirDesk.exe слишком длинный для автозапуска. Переместите приложение ближе к корню диска.");
         using var key = Registry.CurrentUser.CreateSubKey(RunKey) ?? throw new InvalidOperationException("Windows не разрешила изменить автозапуск.");
         key.SetValue(Name, command, RegistryValueKind.String);
+    }
+
+    static string? Read(RegistryKey? key) =>
+        key?.GetValue(Name, defaultValue: null, RegistryValueOptions.DoNotExpandEnvironmentNames) as string;
+
+    internal static void RemoveOwned(RegistryKey? key, string? command)
+    {
+        // The registration may have changed since the settings page last read it.
+        if (key != null && command != null && Read(key) == command)
+            key.DeleteValue(Name, throwOnMissingValue: false);
     }
 }

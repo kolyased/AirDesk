@@ -1,5 +1,8 @@
 using System;
+using System.ComponentModel;
 using System.Globalization;
+using System.IO;
+using System.Security;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Interop;
@@ -11,7 +14,9 @@ namespace AirDesk;
 
 public sealed partial class Dashboard
 {
-    readonly TextBlock fpsStatus = Text("Источник FPS отключён. Обычные датчики работают независимо.", 12);
+    const string FramesDisabled = "Источник FPS отключён. Обычные датчики работают независимо.";
+    readonly TextBlock fpsStatus = Text(FramesDisabled, 12);
+    string? fpsInputError;
     FrameCapture? frames;
     Window? overlay;
     TextBlock? overlayText;
@@ -21,7 +26,7 @@ public sealed partial class Dashboard
     {
         var body = new StackPanel();
         body.Children.Add(Text("FPS и экранная панель", 19));
-        AddWrapped(body, "Для FPS запустите PresentMon отдельно с параметром --v1_metrics. Здесь укажите его CSV и PID процесса.");
+        AddWrapped(body, "Для FPS запустите запись PresentMon по инструкции «FPS и экранная панель» в справке AirDesk. Здесь укажите CSV и PID процесса.");
         var source = new WrapPanel();
         var pid = new TextBox { Width = 92, MaxLength = 10, Margin = new Thickness(0, 0, 8, 5) };
         NameForAutomation(pid, "PID для измерения FPS");
@@ -31,25 +36,34 @@ public sealed partial class Dashboard
         {
             if (!int.TryParse(pid.Text, out int target) || target <= 0)
             {
-                fpsStatus.Text = "Укажите положительный PID из диспетчера задач.";
+                ShowInputError("Укажите положительный PID из диспетчера задач.");
                 return;
             }
-            var file = new OpenFileDialog { Filter = "CSV PresentMon|*.csv", CheckFileExists = true };
-            if (file.ShowDialog(this) != true) return;
             try
             {
+                var file = new OpenFileDialog { Filter = "CSV PresentMon|*.csv", CheckFileExists = true };
+                if (file.ShowDialog(this) != true) return;
                 var reader = new FrameCapture(file.FileName, target);
                 frames?.Dispose();
                 frames = reader;
+                fpsInputError = null;
                 RenderFrames(force: true);
             }
-            catch (Exception error) { fpsStatus.Text = error.Message; }
+            catch (ArgumentException)
+            {
+                ShowInputError("Выберите CSV PresentMon на локальном диске.");
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException or Win32Exception)
+            {
+                Monitor.Log(error);
+                ShowInputError("Не удалось подключить CSV PresentMon. Проверьте путь и разрешение на чтение файла.");
+            }
         }));
         source.Children.Add(Button("Отключить FPS", () =>
         {
             frames?.Dispose();
             frames = null;
-            fpsStatus.Text = "Источник FPS отключён. Обычные датчики работают независимо.";
+            fpsInputError = null;
             RenderFrames(force: true);
         }));
         body.Children.Add(source);
@@ -85,6 +99,12 @@ public sealed partial class Dashboard
         opacity.ValueChanged += (_, _) => { if (!opacity.IsMouseCaptureWithin) Set(preferences.Overlay with { Opacity = opacity.Value }); };
         opacity.LostMouseCapture += (_, _) => Set(preferences.Overlay with { Opacity = opacity.Value });
         return Surface(body, new Thickness(14), new Thickness(0, 0, 0, 12));
+
+        void ShowInputError(string message)
+        {
+            fpsInputError = message;
+            RenderFrames(force: true);
+        }
 
         Slider AddSlider(string name, double min, double max, double step, double value)
         {
@@ -145,19 +165,17 @@ public sealed partial class Dashboard
 
     void RenderFrames(bool force = false)
     {
-        if (frames == null && overlay == null || !force && Environment.TickCount64 < updateFramesAt) return;
+        if (!force && ((frames == null && overlay == null) || Environment.TickCount64 < updateFramesAt)) return;
         updateFramesAt = Environment.TickCount64 + 950;
-        var rate = frames?.Current;
-        if (frames != null)
-        {
-            string detail = rate == null ? frames.Status : $"{rate.FramesPerSecond:0.#} кадр/с · медиана {rate.MedianMilliseconds:0.0} мс";
-            if (fpsStatus.Text != detail) fpsStatus.Text = detail;
-        }
+        var (rate, status) = frames?.Snapshot ?? (null, FramesDisabled);
+        string detail = rate == null ? status : $"{rate.FramesPerSecond:0.#} кадр/с · медиана {rate.MedianMilliseconds:0.0} мс";
+        if (fpsInputError != null) detail = frames == null ? fpsInputError : fpsInputError + "\n" + detail;
+        if (fpsStatus.Text != detail) fpsStatus.Text = detail;
         if (overlayText == null) return;
         var values = new System.Collections.Generic.List<string>(5);
         var flags = preferences.Overlay.Metrics;
         var telemetry = viewModel.Stalled ? null : latest?.Telemetry;
-        var gpu = telemetry?.PrimaryGpu(preferences.Gpu);
+        var gpu = telemetry == null ? null : preferences.SelectedGpu(telemetry);
         if (flags.HasFlag(OverlayMetric.Frames)) values.Add(rate == null ? "FPS —" : $"FPS {rate.FramesPerSecond:0}");
         if (flags.HasFlag(OverlayMetric.FrameTime)) values.Add(rate == null ? "Кадр —" : $"Кадр {rate.MedianMilliseconds:0.0} мс");
         if (flags.HasFlag(OverlayMetric.Cpu)) values.Add("CPU " + Metric(telemetry?.Cpu));

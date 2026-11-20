@@ -78,7 +78,7 @@ var
     Current: String;
 begin
     Result := RegQueryStringValue(HKCU, RunKey, 'AirDesk', Current) and
-        (CompareText(Current, RunCommand) = 0);
+        (Current = RunCommand);
 end;
 
 function BlockReason: String;
@@ -112,7 +112,12 @@ begin
     if Step <> ssPostInstall then
         exit;
     if WizardIsTaskSelected('autostart') then
-        RegWriteStringValue(HKCU, RunKey, 'AirDesk', RunCommand)
+    begin
+        if not RegValueExists(HKCU, RunKey, 'AirDesk') then
+            RegWriteStringValue(HKCU, RunKey, 'AirDesk', RunCommand)
+        else if not OwnsStartup then
+            Log('AirDesk startup registration already exists for a different command. Keeping it unchanged.');
+    end
     else if OwnsStartup then
         RegDeleteValue(HKCU, RunKey, 'AirDesk');
 end;

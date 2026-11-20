@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -17,15 +18,24 @@ internal static class ControllerProcesses
     {
         try
         {
-            string[] names = Process.GetProcesses().Select(process =>
+            Process[] processes = Process.GetProcesses();
+            try
             {
-                using (process)
+                HashSet<string>? names = null;
+                foreach (Process process in processes)
                 {
-                    try { return ControllerNames.Match(process.ProcessName); }
-                    catch (InvalidOperationException) { return null; } // Process exited during enumeration.
+                    string? name;
+                    try { name = ControllerNames.Match(process.ProcessName); }
+                    catch (InvalidOperationException) { continue; } // Process exited during enumeration.
+                    if (name != null) (names ??= new(StringComparer.Ordinal)).Add(name);
                 }
-            }).OfType<string>().Distinct().Order().ToArray();
-            return names.Length == 0 ? null : $"Управление недоступно: обнаружен {string.Join(", ", names)}. Завершите его, включая трей или службу. Захват канала этим ПО не подтверждён.";
+                return names == null ? null :
+                    $"Управление недоступно. Обнаружены процессы: {string.Join(", ", names.Order(StringComparer.Ordinal))}. Закройте приложения, включая трей и службы. Обнаружение процесса не подтверждает захват канала.";
+            }
+            finally
+            {
+                foreach (Process process in processes) process.Dispose();
+            }
         }
         catch (Exception error)
         {
@@ -33,7 +43,6 @@ internal static class ControllerProcesses
             return "Не удалось проверить запущенные контроллеры. Управление заблокировано.";
         }
     }
-
 }
 
 internal sealed class LocalCalibration : ICalibrationStore

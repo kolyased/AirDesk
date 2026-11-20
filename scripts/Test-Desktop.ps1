@@ -47,8 +47,13 @@ if (!$monitoring.WindowVisible -or $monitoring.Cooling.CanEnable -or $monitoring
 if ($ExpectNoPawnIO -and ($monitoring.Driver.Registration -ne 0 -or $monitoring.Driver.Version)) {
     throw 'Diagnostics did not detect the missing driver.'
 }
-$historyPath = Join-Path $folder 'benchmark-history/history-v1.json'
-if (!(Test-Path -LiteralPath $historyPath) -or ((Get-Content -LiteralPath $historyPath -Raw | ConvertFrom-Json).Points.Count -eq 0)) {
+$historyPath = Join-Path $folder 'benchmark-history/history-v2.json.gz'
+if (!(Test-Path -LiteralPath $historyPath)) { throw 'The test copy did not persist the recorded history.' }
+$historyFile = [IO.File]::OpenRead($historyPath)
+$historyReader = [IO.StreamReader]::new([IO.Compression.GZipStream]::new($historyFile, [IO.Compression.CompressionMode]::Decompress))
+try { $journal = $historyReader.ReadToEnd() | ConvertFrom-Json }
+finally { $historyReader.Dispose() }
+if ($journal.Version -ne 2 -or !($journal.Series | Where-Object { $_.Samples.Count -gt 0 })) {
     throw 'The test copy did not persist the recorded history.'
 }
 
