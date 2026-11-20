@@ -6,7 +6,6 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
-using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
@@ -16,7 +15,11 @@ namespace AirDesk;
 public sealed partial class Dashboard
 {
     readonly TextBlock channelStatus = Text("Обнаружение оборудования…", 16), banner = Text("", 14),
-        values = Text("", 13), actionStatus = Text("", 13), restoreStatus = Text("", 13), requestError = Text("", 13);
+        values = Text("", 13), actionStatus = Text("", 13), restoreStatus = Text("", 13), requestError = Text("", 13),
+        requestStatus = Text("", 13), requestDetail = Text("", 12), restoreDetail = Text("", 12),
+        curveTitle = Text("", 15), curveSource = Text("", 13), curveFloor = Text("", 12);
+    readonly Expander actionDetails = new() { Header = "Подробности операции", Visibility = Visibility.Collapsed };
+    readonly DashboardCurvePlot curvePlot = new();
     readonly ComboBox profileChoice = new() { Width = 185 }, primaryChoice = new() { Width = 246 }, secondaryChoice = new() { Width = 246 };
     readonly Slider speed = new() { Minimum = 0, Maximum = 100, Width = 155, TickFrequency = 1, IsSnapToTickEnabled = true };
     readonly TextBlock speedLabel = Text("", 14);
@@ -25,6 +28,9 @@ public sealed partial class Dashboard
         editCurve = null!, previous = null!, startup = null!, lastConfirmed = null!;
     MenuItem calibrate = null!, release = null!, rename = null!;
     FanProfile selected = FanProfile.Default;
+    FanProfile? plottedProfile;
+    CurvePoint[]? plottedPoints;
+    Action<CoolingView, bool>? refreshCurveEditor;
     ChannelIdentity? channel;
     TemperatureInput[] sources = [];
     bool editingControls, dragging, commandPending;
@@ -47,28 +53,33 @@ public sealed partial class Dashboard
         {
             if (MessageBox.Show(this, "Вы подтвердили подключение и устойчивое вращение всей группы на минимуме? BIOS/EC снова регулирует обороты после теста?",
                 "Сохранить привязку", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
-                _ = Execute(viewModel.SaveCalibration);
+                _ = Execute(viewModel.SaveCalibration, "Не удалось сохранить калибровку. Проверьте результат теста и возврат BIOS/EC.");
         });
         confirm = Button("Подтвердить прежнее подключение", () =>
         {
             if (MessageBox.Show(this, "Хаб, порт, PWM/DC и состав вентиляторов совпадают с сохранённой привязкой? При изменениях выполните калибровку заново.",
                 "Проверка подключения", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
-                _ = Execute(viewModel.ConfirmTopology);
+                _ = Execute(viewModel.ConfirmTopology, "Не удалось подтвердить подключение. Проверьте привязку и доступность датчиков.");
         });
         enable = Button("Включить управление", () => _ = EnableAsync());
-        void Restore() { debounce.Stop(); viewModel.Release(); requestError.Text = "Запрошен возврат BIOS/EC."; }
+        void Restore()
+        {
+            debounce.Stop();
+            viewModel.Release();
+            ShowCoolingAction("Возврат BIOS/EC запрошен. Дождитесь подтверждения ниже.");
+        }
         release = MenuAction("Вернуть управление BIOS/EC", Restore, "Прекращает регулировку AirDesk или отменяет текущую калибровку.");
         emergencyRelease = Button("Остановить управление", Restore, "Возвращает разъём к контролю BIOS/EC.");
         recovery = Button("Подтвердить проверку BIOS/EC", () =>
         {
             if (MessageBox.Show(this, "Подтвердите, что после перезагрузки вы проверили в BIOS/EC работу вентиляторов и автономный режим.",
                 "Восстановление после сбоя", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes)
-                _ = Execute(viewModel.AcknowledgeRecovery);
+                _ = Execute(viewModel.AcknowledgeRecovery, "Не удалось снять блокировку. Проверьте состояние BIOS/EC и разъёма.");
         });
         rename = MenuAction("Переименовать группу…", () =>
         {
             string? name = Prompt("Название группы", latest?.Cooling.Group ?? "", 48);
-            if (name != null) _ = Execute(() => viewModel.Rename(name));
+            if (name != null) _ = Execute(() => viewModel.Rename(name), "Не удалось переименовать группу. Проверьте доступность сохранённой привязки.");
         }, "Меняет название группы в обзоре, трее и диагностике.");
         var actions = new ContextMenu { Placement = PlacementMode.Bottom };
         var extra = Button("Дополнительно ▾", () => actions.IsOpen = true, "Калибровка, имя группы, возврат BIOS/EC и отчёт оборудования.");
@@ -99,8 +110,16 @@ public sealed partial class Dashboard
         startup = Button("Сделать профилем по умолчанию", () =>
         {
             if (channel == null) return;
-            try { preferences.SetStartupProfile(channel, selected); requestError.Text = "Профиль по умолчанию сохранён. Следующий сеанс начнётся с мониторинга."; }
-            catch (Exception error) { Monitor.Log(error); requestError.Text = "Не удалось сохранить профиль по умолчанию."; }
+            try
+            {
+                preferences.SetStartupProfile(channel, selected);
+                ShowCoolingAction("Профиль по умолчанию сохранён. Следующий сеанс начнётся с мониторинга.");
+            }
+            catch (Exception error)
+            {
+                Monitor.Log(error);
+                ShowCoolingAction("Не удалось сохранить профиль по умолчанию. Проверьте доступ к папке настроек.", error: true, error.Message);
+            }
         });
         foreach (var button in new[] { editCurve, previous, lastConfirmed, startup }) profiles.Children.Add(button);
         panel.Children.Add(profiles);
@@ -124,32 +143,66 @@ public sealed partial class Dashboard
         debounce.Tick += (_, _) => { debounce.Stop(); _ = ChangeProfile(selected with { Manual = (float)speed.Value }); };
         var result = new StackPanel { Margin = new(0, 10, 0, 0) };
         result.Children.Add(Text("Последнее действие", 15));
-        foreach (var line in new[] { actionStatus, restoreStatus, requestError })
+        foreach (var line in new[] { requestStatus, requestError, actionStatus, restoreStatus, requestDetail, restoreDetail })
         {
             line.TextWrapping = TextWrapping.Wrap;
-            result.Children.Add(line);
+            line.Visibility = Visibility.Collapsed;
         }
+        foreach (var line in new[] { requestStatus, requestError, actionStatus, restoreStatus }) result.Children.Add(line);
+        var details = new StackPanel();
+        details.Children.Add(requestDetail);
+        details.Children.Add(restoreDetail);
+        actionDetails.Content = details;
+        result.Children.Add(actionDetails);
         panel.Children.Add(result);
+        var curve = new StackPanel { Margin = new(0, 12, 0, 0) };
+        curve.Children.Add(curveTitle);
+        curveSource.TextWrapping = curveFloor.TextWrapping = TextWrapping.Wrap;
+        curve.Children.Add(curveSource);
+        NameForAutomation(curvePlot, "График профиля охлаждения");
+        curve.Children.Add(curvePlot);
+        curve.Children.Add(CurveLegend());
+        curve.Children.Add(curveFloor);
+        panel.Children.Add(curve);
         SetProfileFields();
+        RenderCurvePreview(null, stale: false);
         return Surface(panel, new Thickness(16), new Thickness(0, 12, 0, 0));
     }
 
-    async Task<bool> Execute(Func<Task<string>> command)
+    static void SetCoolingLine(TextBlock line, string next)
+    {
+        if (line.Text != next) line.Text = next;
+        line.Visibility = next.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    void ShowCoolingAction(string status, bool error = false, string detail = "")
+    {
+        SetCoolingLine(requestStatus, error ? "" : status);
+        SetCoolingLine(requestError, error ? status : "");
+        SetCoolingLine(requestDetail, detail);
+        actionDetails.IsExpanded = false;
+        actionDetails.Visibility = (requestDetail.Text.Length > 0 || restoreDetail.Text.Length > 0) ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    async Task<bool> Execute(Func<Task<string>> command, string failure)
     {
         if (commandPending || quitting) return false;
         commandPending = true;
-        requestError.Text = "Обработка команды…";
+        ShowCoolingAction("Обработка команды…");
         try
         {
             string result = await command().WaitAsync(TimeSpan.FromSeconds(5));
-            requestError.Text = result;
+            if (result.Length == 0) ShowCoolingAction("");
+            else ShowCoolingAction(failure, error: true, result);
             return result.Length == 0;
         }
         catch (Exception error)
         {
             viewModel.Release();
             Monitor.Log(error);
-            requestError.Text = "Команда прервана. Запрошен возврат BIOS/EC.";
+            ShowCoolingAction(error is TimeoutException
+                ? "Контроллер не ответил вовремя. Запрошен возврат BIOS/EC. Проверьте подтверждение ниже."
+                : "Команда прервана. Запрошен возврат BIOS/EC. Проверьте подтверждение ниже.", error: true, error.Message);
             return false;
         }
         finally { commandPending = false; }
@@ -159,7 +212,8 @@ public sealed partial class Dashboard
     {
         if (channel is not { } key) return;
         FanProfile requested = selected;
-        if (await Execute(() => viewModel.Enable(requested))) SaveSelection(key, requested, confirmed: true);
+        if (await Execute(() => viewModel.Enable(requested),
+            "Не удалось включить управление. Проверьте состояние разъёма, выбранные датчики и возможный конфликт.")) SaveSelection(key, requested, confirmed: true);
     }
 
     void QueueSpeed()
@@ -177,11 +231,24 @@ public sealed partial class Dashboard
 
     async Task ChangeProfile(FanProfile profile)
     {
-        if (channel == null || latest?.Cooling is not { } cooling || commandPending || viewModel.Stalled ||
-            (!cooling.CanEnable && !cooling.CanAdjust)) { SetProfileFields(); return; }
-        if (!Curve.Valid(profile)) { requestError.Text = "Недопустимая кривая или повторяющиеся датчики."; SetProfileFields(); return; }
-        var key = channel;
-        if (cooling.CanAdjust && !await Execute(() => viewModel.Adjust(profile))) { SetProfileFields(); return; }
+        if (channel is not { } key || latest?.Cooling is not { } cooling || !CanEditCooling(cooling, previousStale))
+        {
+            SetProfileFields();
+            return;
+        }
+        if (!Curve.Valid(profile))
+        {
+            ShowCoolingAction("Профиль не изменён. Проверьте порядок точек и выберите разные датчики.", error: true);
+            SetProfileFields();
+            return;
+        }
+        if (cooling.CanAdjust && !await Execute(() => viewModel.Adjust(profile),
+            "Профиль не применён. Проверьте выбранные датчики и состояние управления."))
+        {
+            SetProfileFields();
+            return;
+        }
+        if (!cooling.CanAdjust) ShowCoolingAction("Профиль выбран. Он начнёт действовать после включения управления.");
         SaveSelection(key, profile, confirmed: cooling.CanAdjust);
         SetProfileFields();
     }
@@ -194,7 +261,9 @@ public sealed partial class Dashboard
             Monitor.Log(error);
             if (confirmed) viewModel.Release();
             if (channel == key) selected = preferences.Find(key)?.Current ?? FanProfile.Default;
-            requestError.Text = confirmed ? "Не удалось сохранить профиль. Запрошен возврат BIOS/EC." : "Не удалось сохранить профиль.";
+            ShowCoolingAction(confirmed
+                ? "Профиль не сохранён. Запрошен возврат BIOS/EC. Проверьте подтверждение ниже."
+                : "Профиль не сохранён. Проверьте доступ к папке настроек.", error: true, error.Message);
         }
     }
 
@@ -209,6 +278,7 @@ public sealed partial class Dashboard
         LoadSources(primaryChoice, "Температура процессора · авто", selected.Primary);
         LoadSources(secondaryChoice, "Один датчик", selected.Secondary);
         editingControls = false;
+        RenderCurvePreview(latest?.Cooling, previousStale);
     }
 
     void LoadSources(ComboBox box, string defaultLabel, SensorReference? selectedSource)
@@ -250,8 +320,16 @@ public sealed partial class Dashboard
         values.Text = $"Тахометр хаба: {Format(stale ? null : cooling.Rpm, "об/мин")} (один сигнал) · минимум: {Format(cooling.Floor, "%")}\n" +
             $"Задано: {Format(cooling.Requested, "%")} · отправлено: {Format(cooling.Sent, "%")} · подтверждение команды: {confirmation}" +
             (cooling.Source == null ? "" : $"\nИсточник кривой: {FriendlySource(cooling.Source)}");
-        actionStatus.Text = cooling.Action.Length == 0 ? "Ожидание команды." : cooling.Action;
-        restoreStatus.Text = cooling.Restore;
+        SetCoolingLine(actionStatus, cooling.Action);
+        SetCoolingLine(restoreStatus, cooling.State == ChannelState.Restoring ? "Проверяется возврат управления BIOS/EC…" :
+            cooling.BiosRestoreConfirmed switch
+            {
+                true => "Проверка возврата BIOS/EC завершена.",
+                false => "Возврат BIOS/EC не подтверждён. Проверьте охлаждение в BIOS/EC.",
+                _ => ""
+            });
+        SetCoolingLine(restoreDetail, cooling.Restore);
+        actionDetails.Visibility = requestDetail.Text.Length > 0 || restoreDetail.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
         calibrate.IsEnabled = !stale && !commandPending && cooling.CanCalibrate;
         Toggle(saveCalibration, !stale && cooling.CanSave);
         Toggle(confirm, !stale && cooling.CanConfirm && cooling.State != ChannelState.Verified);
@@ -260,8 +338,9 @@ public sealed partial class Dashboard
         enable.IsEnabled = !stale && !commandPending && cooling.CanEnable;
         release.IsEnabled = cooling.CanRelease || stale;
         Toggle(emergencyRelease, cooling.CanRelease || stale);
-        bool canEdit = !stale && !commandPending && (cooling.CanEnable || cooling.CanAdjust);
-        profileChoice.IsEnabled = editCurve.IsEnabled = canEdit;
+        bool canEdit = CanEditCooling(cooling, stale);
+        profileChoice.IsEnabled = canEdit;
+        editCurve.Content = canEdit ? "Редактор кривой…" : "Посмотреть кривые…";
         primaryChoice.IsEnabled = secondaryChoice.IsEnabled = canEdit && selected.Kind != ProfileKind.Manual;
         speed.IsEnabled = canEdit && selected.Kind == ProfileKind.Manual;
         speed.Visibility = speedLabel.Visibility = selected.Kind == ProfileKind.Manual ? Visibility.Visible : Visibility.Collapsed;
@@ -269,6 +348,46 @@ public sealed partial class Dashboard
         previous.IsEnabled = canEdit && saved?.Previous != null;
         lastConfirmed.IsEnabled = canEdit && saved?.LastConfirmed is { } confirmed && !selected.SameSettings(confirmed);
         startup.IsEnabled = canEdit && !selected.SameSettings(saved?.Startup);
+        RenderCurvePreview(cooling, stale);
+        refreshCurveEditor?.Invoke(cooling, stale);
+    }
+
+    bool CanEditCooling(CoolingView cooling, bool stale) => !stale && !quitting && !commandPending && (cooling.CanEnable || cooling.CanAdjust);
+
+    static TextBlock CurveLegend()
+    {
+        var line = Text("Пунктир — профиль. Сплошная линия учитывает проверенный минимум и тепловую защиту. Кружок — подтверждённая команда.", 12);
+        line.TextWrapping = TextWrapping.Wrap;
+        return line;
+    }
+
+    void RenderCurvePreview(CoolingView? cooling, bool stale)
+    {
+        var shown = cooling?.ActiveProfile ?? selected;
+        if (!ReferenceEquals(shown, plottedProfile))
+        {
+            plottedProfile = shown;
+            plottedPoints = CurvePreview.ProfilePoints(shown);
+        }
+        curveTitle.Text = $"{(cooling?.State == ChannelState.Controlled ? "Действует" : "Выбран профиль")} · {ProfileLabel(shown.Kind)}";
+        float? floor = cooling?.VerifiedFloor;
+        curvePlot.SetCurve(plottedPoints, floor);
+        CurvePoint? live = !stale && cooling is { CurveCommandConfirmed: true, CurveTemperature: float temperature, Command: float output }
+            ? new(temperature, output) : null;
+        curvePlot.SetLivePoint(live, cooling?.TemperatureProtection == true);
+        var input = !stale && displayed is { } data ? Curve.Resolve(shown, LiveValue(data.Cpu?.Temperature, false), data.CurveSources) : (null, "");
+        if (live != null)
+        {
+            string protection = cooling!.TemperatureProtection ? $" · тепловая защита (CPU {Format(cooling.CpuTemperature, "°C")})" : "";
+            curveSource.Text = $"{FriendlySource(cooling.Source ?? input.Item2)} · {Format(live.Celsius, "°C")} · команда {Format(live.Percent, "%")}{protection}";
+        }
+        else if (stale) curveSource.Text = "Показания источника устарели.";
+        else if (shown.Kind == ProfileKind.Manual) curveSource.Text = "Ручная скорость · температура CPU используется для защиты.";
+        else if (input.Item1.HasValue) curveSource.Text = $"{FriendlySource(input.Item2)} · {Format(input.Item1, "°C")}";
+        else curveSource.Text = shown.Primary == null && shown.Secondary == null ? "Температура процессора · нет показаний" :
+            "Выбранный источник температуры недоступен. Проверьте датчики профиля.";
+        curveFloor.Text = floor.HasValue ? $"Проверенный минимум {Format(floor, "%")} · тепловая защита от {FanPolicy.EmergencyTemperature:0} °C."
+            : $"Минимум группы появится после калибровки. Порог тепловой защиты {FanPolicy.EmergencyTemperature:0} °C.";
     }
 
     static void Toggle(Button button, bool visible) { button.IsEnabled = visible; button.Visibility = visible ? Visibility.Visible : Visibility.Collapsed; }
@@ -309,104 +428,153 @@ public sealed partial class Dashboard
             result = new(identity, group.Text.Trim(), topology.Text.Trim(), (SignalMode)signal.SelectedIndex, min);
             window.DialogResult = true;
         }));
-        if (window.ShowDialog() == true && result is { } proposal) _ = Execute(() => viewModel.Calibrate(proposal));
+        if (window.ShowDialog() == true && result is { } proposal) _ = Execute(() => viewModel.Calibrate(proposal),
+            "Калибровка не началась. Проверьте, что датчики отвечают, а охлаждение сейчас регулирует BIOS/EC.");
     }
 
     void EditCurve()
     {
-        var window = Dialog("Кривая охлаждения", 570, 565, out StackPanel content);
-        AddWrapped(content, $"Перетащите точку или измените её числа. Точки задают профиль, линия показывает команду с учётом минимума группы {Format(latest?.Cooling.Floor, "%")} и порога {FanPolicy.EmergencyTemperature:0} °C.");
-        var canvas = new Canvas { Height = 145, Margin = new(0, 4, 0, 8) };
-        canvas.SetResourceReference(Panel.BackgroundProperty, AppTheme.Background);
-        content.Children.Add(canvas);
+        bool canEdit = latest?.Cooling is { } cooling && CanEditCooling(cooling, previousStale);
+        var window = BuildCurveEditor(canEdit, out var readResult);
+        if (window.ShowDialog() == true && readResult() is { } result)
+            _ = ChangeProfile(selected with { Kind = ProfileKind.Custom, Custom = result });
+    }
+
+    Window BuildCurveEditor(bool allowEditing, out Func<CurvePoint[]?> readResult)
+    {
+        var window = Dialog(allowEditing ? "Редактор кривой" : "Кривые охлаждения", 645, 640, out StackPanel content);
+        AddWrapped(content, allowEditing ? "Выберите базовую кривую. Перетащите точку или измените её значения." :
+            "Выберите профиль для просмотра. Управление можно настроить после проверки разъёма.");
+        ProfileKind[] kinds = [ProfileKind.Quiet, ProfileKind.Balanced, ProfileKind.Performance, ProfileKind.Custom];
+        var preset = new ComboBox { ItemsSource = kinds.Select(ProfileLabel).ToArray(), HorizontalAlignment = HorizontalAlignment.Left,
+            MinWidth = 155, Margin = new(0, 4, 0, 4) };
+        preset.SelectedIndex = Math.Max(0, Array.IndexOf(kinds, selected.Kind == ProfileKind.Manual ? ProfileKind.Balanced : selected.Kind));
+        NameForAutomation(preset, "Кривая для просмотра");
+        content.Children.Add(preset);
+
+        var plot = new DashboardCurvePlot { Height = 220 };
+        NameForAutomation(plot, "Сигнал разъёма по температуре");
+        content.Children.Add(plot);
+        content.Children.Add(CurveLegend());
         var points = new StackPanel();
-        var scroll = new ScrollViewer { Content = points, MaxHeight = 215, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
-        content.Children.Add(scroll);
-        var validation = Text("", 12); content.Children.Add(validation);
+        content.Children.Add(new ScrollViewer { Content = points, MaxHeight = 175, VerticalScrollBarVisibility = ScrollBarVisibility.Auto });
+        var validation = Text("", 13);
+        validation.TextWrapping = TextWrapping.Wrap;
+        validation.SetResourceReference(TextBlock.ForegroundProperty, AppTheme.Warning);
+        content.Children.Add(validation);
+        var actions = new WrapPanel();
+        content.Children.Add(actions);
         var rows = new List<(TextBox Celsius, TextBox Percent)>();
         int? draggedPoint = null;
         bool draggingUpdate = false;
-        const double plotLeft = 35, plotTop = 5;
-        double WidthOfPlot() => Math.Max(1, canvas.ActualWidth - 52);
-        double HeightOfPlot() => canvas.Height - 28;
-        Point Plot(float celsius, float percent) => new(plotLeft + celsius * WidthOfPlot() / 100, plotTop + HeightOfPlot() * (1 - percent / 100));
+        float? floor = latest?.Cooling.VerifiedFloor;
+        bool editingAvailable = allowEditing;
+        var add = Button("Добавить точку");
+        var save = Button("Сохранить");
+        if (allowEditing) { actions.Children.Add(add); actions.Children.Add(save); }
+
         CurvePoint[]? Read() => rows.All(row => float.TryParse(row.Celsius.Text, out _) && float.TryParse(row.Percent.Text, out _))
             ? rows.Select(row => new CurvePoint(float.Parse(row.Celsius.Text), float.Parse(row.Percent.Text))).ToArray() : null;
+        readResult = Read;
+
         void Preview()
         {
-            canvas.Children.Clear();
-            var data = Read();
-            if (!Curve.ValidPoints(data)) { validation.Text = "Нужны 2–12 точек, возрастающая температура и неубывающий процент (0–100)."; return; }
-            validation.Text = "";
-            double width = WidthOfPlot(), height = HeightOfPlot();
-            var graphPoints = Enumerable.Range(0, 101).Select(t =>
+            var working = Read();
+            bool valid = Curve.ValidPoints(working);
+            validation.Text = !valid ? "Задайте 2–12 точек с возрастающей температурой и неубывающим сигналом от 0 до 100%." :
+                allowEditing && !editingAvailable ? "Редактор временно недоступен. Проверьте состояние охлаждения в основном окне." : "";
+            validation.Visibility = validation.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+            save.IsEnabled = editingAvailable && valid;
+            add.IsEnabled = editingAvailable && valid && rows.Count < 12;
+            plot.SetCurve(valid ? working : null, floor, showHandles: allowEditing);
+        }
+
+        void Populate(CurvePoint[] curve)
+        {
+            points.Children.Clear();
+            rows.Clear();
+            for (int i = 0; i < curve.Length; i++)
             {
-                float duty = t >= FanPolicy.EmergencyTemperature ? 100 : Math.Max(latest?.Cooling.Floor ?? 0, Curve.Interpolate(data!, t));
-                return Plot(t, duty);
-            });
-            var line = new Polyline { StrokeThickness = 2, Points = new PointCollection(graphPoints) };
-            line.SetResourceReference(Shape.StrokeProperty, AppTheme.Accent); canvas.Children.Add(line);
-            foreach (var point in data!)
-            {
-                Point position = Plot(point.Celsius, point.Percent);
-                var marker = new Ellipse { Width = 9, Height = 9 };
-                marker.SetResourceReference(Shape.FillProperty, AppTheme.Text); marker.SetResourceReference(Shape.StrokeProperty, AppTheme.Accent);
-                Canvas.SetLeft(marker, position.X - 4.5); Canvas.SetTop(marker, position.Y - 4.5);
-                canvas.Children.Add(marker);
+                var point = curve[i];
+                var row = new WrapPanel { Margin = new(0, 0, 0, 4) };
+                var temperature = new TextBox { Width = 74, Text = point.Celsius.ToString(CultureInfo.CurrentCulture), IsReadOnly = !allowEditing };
+                var percent = new TextBox { Width = 74, Text = point.Percent.ToString(CultureInfo.CurrentCulture), IsReadOnly = !allowEditing };
+                NameForAutomation(temperature, $"Температура точки {i + 1}");
+                NameForAutomation(percent, $"Сигнал точки {i + 1}");
+                row.Children.Add(temperature); row.Children.Add(Text(" °C     ", 13));
+                row.Children.Add(percent); row.Children.Add(Text(" %    ", 13));
+                if (allowEditing) row.Children.Add(Button("Удалить", () =>
+                {
+                    if (!editingAvailable || rows.Count <= 2) return;
+                    rows.Remove((temperature, percent));
+                    points.Children.Remove(row);
+                    Preview();
+                }));
+                rows.Add((temperature, percent));
+                points.Children.Add(row);
+                temperature.TextChanged += (_, _) => { if (!draggingUpdate) Preview(); };
+                percent.TextChanged += (_, _) => { if (!draggingUpdate) Preview(); };
             }
-            foreach (var (label, x, y) in new[] { ("100%", 2.0, 0.0), ("0%", 8.0, height), ("0 °C", 35.0, height + 6), ("100 °C", width - 1, height + 6) })
-            { var text = Text(label, 10); Canvas.SetLeft(text, x); Canvas.SetTop(text, y); canvas.Children.Add(text); }
-        }
-        void Add(CurvePoint point)
-        {
-            if (rows.Count == 12) return;
-            var row = new WrapPanel { Margin = new(0, 0, 0, 4) };
-            var temperature = new TextBox { Width = 75, Text = point.Celsius.ToString(CultureInfo.CurrentCulture) };
-            var percent = new TextBox { Width = 75, Text = point.Percent.ToString(CultureInfo.CurrentCulture) };
-            row.Children.Add(temperature); row.Children.Add(Text(" °C     ", 13)); row.Children.Add(percent); row.Children.Add(Text(" %    ", 13));
-            row.Children.Add(Button("Удалить", () => { rows.Remove((temperature, percent)); points.Children.Remove(row); Preview(); }));
-            rows.Add((temperature, percent)); points.Children.Add(row);
-            temperature.TextChanged += (_, _) => { if (!draggingUpdate) Preview(); };
-            percent.TextChanged += (_, _) => { if (!draggingUpdate) Preview(); };
-        }
-        void Populate(CurvePoint[] data) { points.Children.Clear(); rows.Clear(); foreach (var point in data) Add(point); Preview(); }
-        Populate(selected.Custom);
-        canvas.SizeChanged += (_, _) => Preview();
-        canvas.MouseLeftButtonDown += (_, e) =>
-        {
-            var data = Read();
-            if (!Curve.ValidPoints(data)) return;
-            Point location = e.GetPosition(canvas);
-            int index = Enumerable.Range(0, data!.Length).MinBy(i => (Plot(data[i].Celsius, data[i].Percent) - location).LengthSquared);
-            if ((Plot(data[index].Celsius, data[index].Percent) - location).Length <= 12 && canvas.CaptureMouse())
-            { draggedPoint = index; e.Handled = true; }
-        };
-        canvas.MouseMove += (_, e) =>
-        {
-            if (draggedPoint is not int index || Read() is not { } data) return;
-            Point location = e.GetPosition(canvas);
-            var point = Curve.ConstrainPoint(data, index, MathF.Round((float)((location.X - plotLeft) / WidthOfPlot() * 100), 1),
-                MathF.Round((float)((1 - (location.Y - plotTop) / HeightOfPlot()) * 100), 1));
-            draggingUpdate = true;
-            rows[index].Celsius.Text = point.Celsius.ToString("G", CultureInfo.CurrentCulture);
-            rows[index].Percent.Text = point.Percent.ToString("G", CultureInfo.CurrentCulture);
-            draggingUpdate = false;
             Preview();
-        };
-        canvas.MouseLeftButtonUp += (_, _) => { draggedPoint = null; if (canvas.IsMouseCaptured) canvas.ReleaseMouseCapture(); };
-        canvas.LostMouseCapture += (_, _) => draggedPoint = null;
-        var buttons = new WrapPanel(); content.Children.Add(buttons);
-        buttons.Children.Add(Button("Добавить точку", () =>
+        }
+
+        void LoadPreset()
         {
-            var data = Read();
-            if (!Curve.ValidPoints(data) || data!.Length >= 12) return;
-            int index = Enumerable.Range(0, data.Length - 1).MaxBy(i => data[i + 1].Celsius - data[i].Celsius);
-            var middle = new CurvePoint((data[index].Celsius + data[index + 1].Celsius) / 2, (data[index].Percent + data[index + 1].Percent) / 2);
-            Populate(data.Take(index + 1).Append(middle).Concat(data.Skip(index + 1)).ToArray());
-        }));
-        buttons.Children.Add(Button("Сбросить", () => Populate(Curve.DefaultPoints(ProfileKind.Balanced))));
-        CurvePoint[]? result = null;
-        buttons.Children.Add(Button("Сохранить", () => { result = Read(); if (Curve.ValidPoints(result)) window.DialogResult = true; }));
-        if (window.ShowDialog() == true && result != null) _ = ChangeProfile(selected with { Kind = ProfileKind.Custom, Custom = result });
+            if (preset.SelectedIndex < 0) return;
+            var kind = kinds[preset.SelectedIndex];
+            Populate(kind == ProfileKind.Custom ? selected.Custom : Curve.DefaultPoints(kind));
+        }
+        preset.SelectionChanged += (_, _) => LoadPreset();
+        LoadPreset();
+
+        if (allowEditing)
+        {
+            add.Click += (_, _) =>
+            {
+                if (!editingAvailable || Read() is not { } data || !Curve.ValidPoints(data) || data.Length >= 12) return;
+                int index = Enumerable.Range(0, data.Length - 1).MaxBy(i => data[i + 1].Celsius - data[i].Celsius);
+                var middle = new CurvePoint((data[index].Celsius + data[index + 1].Celsius) / 2,
+                    (data[index].Percent + data[index + 1].Percent) / 2);
+                Populate(data.Take(index + 1).Append(middle).Concat(data.Skip(index + 1)).ToArray());
+            };
+            save.Click += (_, _) => { if (editingAvailable && Curve.ValidPoints(Read())) window.DialogResult = true; };
+            plot.MouseLeftButtonDown += (_, e) =>
+            {
+                if (!editingAvailable || Read() is not { } data || !Curve.ValidPoints(data)) return;
+                Point location = e.GetPosition(plot);
+                int index = Enumerable.Range(0, data.Length).MinBy(i => (plot.Position(data[i]) - location).LengthSquared);
+                if ((plot.Position(data[index]) - location).Length <= 12 && plot.CaptureMouse())
+                {
+                    draggedPoint = index;
+                    e.Handled = true;
+                }
+            };
+            plot.MouseMove += (_, e) =>
+            {
+                if (!editingAvailable || draggedPoint is not int index || Read() is not { } data) return;
+                var position = plot.ValueAt(e.GetPosition(plot));
+                var point = Curve.ConstrainPoint(data, index, position.Celsius, position.Percent);
+                draggingUpdate = true;
+                rows[index].Celsius.Text = point.Celsius.ToString("G", CultureInfo.CurrentCulture);
+                rows[index].Percent.Text = point.Percent.ToString("G", CultureInfo.CurrentCulture);
+                draggingUpdate = false;
+                Preview();
+            };
+            plot.MouseLeftButtonUp += (_, _) => { draggedPoint = null; if (plot.IsMouseCaptured) plot.ReleaseMouseCapture(); };
+            plot.LostMouseCapture += (_, _) => draggedPoint = null;
+        }
+        else actions.Children.Add(Button("Закрыть", window.Close));
+
+        void RefreshEditor(CoolingView state, bool stale)
+        {
+            bool available = allowEditing && CanEditCooling(state, stale);
+            if (available == editingAvailable && floor == state.VerifiedFloor) return;
+            editingAvailable = available;
+            floor = state.VerifiedFloor;
+            Preview();
+        }
+        refreshCurveEditor = RefreshEditor;
+        window.Closed += (_, _) => refreshCurveEditor = null;
+        return window;
     }
 }

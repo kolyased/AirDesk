@@ -20,7 +20,9 @@ public sealed partial class Dashboard
     Drawing.Point flyoutAnchor;
     readonly DispatcherTimer trayClick = new(), flyoutDismiss = new();
     long lastDoubleClick;
-    TextBlock flyMetrics = null!, flyState = null!, flyCooling = null!;
+    readonly TextBlock compactSettingsHeading = Text("Мини-панель", 15);
+    TextBlock flyState = null!, flyCooling = null!;
+    Border flyCpu = null!, flyGpu = null!, flyMemory = null!, flyRpm = null!;
     WrapPanel flyProfiles = null!;
     Button flyLastConfirmed = null!;
     bool flyoutPositioning;
@@ -80,17 +82,21 @@ public sealed partial class Dashboard
 
     Window CreateFlyout()
     {
-        var window = new Window { Title = "AirDesk · краткий обзор", Width = 360, SizeToContent = SizeToContent.Height,
+        var window = new Window { Title = "AirDesk · краткий обзор", Width = 328, SizeToContent = SizeToContent.Height,
             WindowStyle = WindowStyle.None, ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false, Topmost = true,
             UseLayoutRounding = true, FontFamily = FontFamily, FontSize = 14 };
         window.SetResourceReference(BackgroundProperty, AppTheme.Background);
         window.SetResourceReference(ForegroundProperty, AppTheme.Text);
         var content = new StackPanel();
-        content.Children.Add(Text("AirDesk", 21));
-        flyMetrics = Text("Ожидание показаний…", 15);
-        flyState = Text("Мониторинг", 13); flyState.TextWrapping = TextWrapping.Wrap;
+        var title = Text("AirDesk", 21);
+        title.FontWeight = FontWeights.SemiBold;
+        content.Children.Add(title);
+        flyCpu = CompactRow("Процессор"); flyGpu = CompactRow("Видеокарта");
+        flyMemory = CompactRow("Память"); flyRpm = CompactRow("Обороты");
+        foreach (var row in new[] { flyCpu, flyGpu, flyMemory, flyRpm }) content.Children.Add(row);
+        flyState = Text("Ожидание показаний…", 13); flyState.TextWrapping = TextWrapping.Wrap;
         flyCooling = Text("", 13); flyCooling.TextWrapping = TextWrapping.Wrap;
-        content.Children.Add(flyMetrics); content.Children.Add(flyCooling); content.Children.Add(flyState);
+        content.Children.Add(flyCooling); content.Children.Add(flyState);
 
         flyProfiles = new WrapPanel { Visibility = Visibility.Collapsed, Margin = new(0, 5, 0, 0) };
         foreach (var kind in new[] { ProfileKind.Quiet, ProfileKind.Balanced, ProfileKind.Performance })
@@ -107,7 +113,12 @@ public sealed partial class Dashboard
         content.Children.Add(flyProfiles);
         var links = new WrapPanel { Margin = new(0, 7, 0, 0) };
         links.Children.Add(Button("Открыть AirDesk", ShowMain));
-        links.Children.Add(Button("Подробности", () => ShowPage(latest?.Cooling.Conflict != null ? CoolingTab : DiagnosticsTab)));
+        links.Children.Add(Button("Подробности", () => ShowPage(latest?.Cooling.State is ChannelState.Conflict or ChannelState.Error ? CoolingTab : DiagnosticsTab)));
+        links.Children.Add(Button("Показатели…", () =>
+        {
+            ShowPage(SettingsTab);
+            Dispatcher.BeginInvoke(() => compactSettingsHeading.BringIntoView(), DispatcherPriority.Loaded);
+        }));
         content.Children.Add(links);
         window.Content = Surface(Scroll(content), new Thickness(14), new Thickness(0));
         window.Deactivated += (_, _) => { if (window.IsVisible) { flyoutDismiss.Stop(); flyoutDismiss.Start(); } };
@@ -115,6 +126,21 @@ public sealed partial class Dashboard
         window.PreviewKeyDown += (_, e) => { if (e.Key == Key.Escape) { window.Hide(); e.Handled = true; } };
         window.SizeChanged += (_, _) => { if (window.IsVisible && !flyoutPositioning) Dispatcher.BeginInvoke(PositionFlyout, DispatcherPriority.Loaded); };
         return window;
+    }
+
+    static Border CompactRow(string name)
+    {
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(new ColumnDefinition());
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var label = Text(name, 13); label.Margin = new(0, 0, 7, 0);
+        var value = Text("—", 14); value.Margin = new(0); value.FontWeight = FontWeights.SemiBold;
+        value.SetResourceReference(TextBlock.ForegroundProperty, AppTheme.Accent);
+        Grid.SetColumn(value, 1);
+        grid.Children.Add(label); grid.Children.Add(value);
+        var row = new Border { Child = grid, CornerRadius = new(5), Padding = new(9, 5, 9, 5), Margin = new(0, 0, 0, 4), Tag = value };
+        row.SetResourceReference(Border.BackgroundProperty, AppTheme.Alternate);
+        return row;
     }
 
     bool CanSwitchTrayProfile() => !autostartSession && !previousStale && !commandPending && !viewModel.Stalled &&
@@ -128,9 +154,11 @@ public sealed partial class Dashboard
     void RenderTray(Telemetry data, CoolingView cooling, bool stale)
     {
         var gpu = preferences.SelectedGpu(data);
-        float? Value(Reading? reading) => !stale && reading?.Available == true ? reading.Value : null;
+        float? Value(Reading? reading) => LiveValue(reading, stale);
         float? cpuTemp = Value(data.Cpu?.Temperature), cpuLoad = Value(data.Cpu?.Load), gpuTemp = Value(gpu?.Temperature), gpuLoad = Value(gpu?.Load),
             ramLoad = Value(data.Ram?.Load), rpm = stale ? null : cooling.Rpm;
+        if (preferences.OverviewFan is { } sensor)
+            rpm = Value(data.Readings.FirstOrDefault(reading => reading.Kind == "Fan" && data.Find(reading.Reference) != null && data.PersistentReference(reading) == sensor));
         static string? Tip(string label, float? value, string unit) => value.HasValue ? $"{label} {value:0} {unit}".TrimEnd() : null;
         string tip = DesktopLayout.Tooltip(preferences.Tooltip.Select(metric => metric switch
         {
@@ -139,11 +167,14 @@ public sealed partial class Dashboard
             TrayMetric.MemoryLoad => Tip("RAM", ramLoad, "%"), TrayMetric.FanRpm => Tip("RPM", rpm, ""), _ => null
         }).OfType<string>());
         if (tray.Text != tip) tray.Text = tip;
-        if (flyout is not { IsVisible: true } && flyState == null) return;
+        if (flyState == null) return;
 
-        flyMetrics.Text = $"Процессор   {Format(cpuTemp, "°C")} · {Format(cpuLoad, "%")}\nВидеокарта   {Format(gpuTemp, "°C")} · {Format(gpuLoad, "%")}\nПамять   {Format(ramLoad, "%")}";
-        string owner = cooling.State == ChannelState.Controlled ? ProfileLabel(selected.Kind) : "Наблюдение";
-        flyCooling.Text = $"{cooling.Group ?? "Охлаждение"} · {owner}\nОбороты: {Format(rpm, "об/мин")}";
+        SetRow(flyCpu, (TrayMetric.CpuTemperature, cpuTemp, "°C"), (TrayMetric.CpuLoad, cpuLoad, "%"));
+        SetRow(flyGpu, (TrayMetric.GpuTemperature, gpuTemp, "°C"), (TrayMetric.GpuLoad, gpuLoad, "%"));
+        SetRow(flyMemory, (TrayMetric.MemoryLoad, ramLoad, "%"));
+        SetRow(flyRpm, (TrayMetric.FanRpm, rpm, "об/мин"));
+        flyCooling.Visibility = cooling.Group != null ? Visibility.Visible : Visibility.Collapsed;
+        flyCooling.Text = cooling.State == ChannelState.Controlled ? $"{cooling.Group} · {ProfileLabel(selected.Kind)}" : $"{cooling.Group} · BIOS/EC";
         flyState.Text = stale ? "Данные устарели. Откройте диагностику." : cooling.Conflict ??
             (requestError.Text.Length != 0 ? requestError.Text : cooling.State == ChannelState.Error ? FriendlyStatus(cooling) : statusHeading.Text);
         bool warning = stale || cooling.State is ChannelState.Conflict or ChannelState.Error || requestError.Text.Length != 0;
@@ -156,6 +187,13 @@ public sealed partial class Dashboard
         flyProfiles.Visibility = canSwitch ? Visibility.Visible : Visibility.Collapsed;
         flyLastConfirmed.Visibility = canSwitch && channel != null && preferences.Find(channel)?.LastConfirmed is { } saved && !selected.SameSettings(saved)
             ? Visibility.Visible : Visibility.Collapsed;
+
+        void SetRow(Border row, params (TrayMetric Metric, float? Value, string Unit)[] readings)
+        {
+            var shown = readings.Where(reading => preferences.CompactMetrics.Contains(reading.Metric)).ToArray();
+            row.Visibility = shown.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+            if (row.Tag is TextBlock value) value.Text = string.Join(" · ", shown.Select(reading => Format(reading.Value, reading.Unit)));
+        }
     }
 
     static string ProfileLabel(ProfileKind kind) => kind switch

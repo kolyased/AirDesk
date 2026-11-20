@@ -48,4 +48,26 @@ public sealed class CurveTests
         Assert.False(Curve.ValidPoints([new(35, 50), new(invalid, 60)]));
         Assert.False(Curve.ValidPoints([new(35, invalid), new(60, 80)]));
     }
+
+    [Fact]
+    public void PreviewShowsFloorIntersectionAndImmediateEmergencyStep()
+    {
+        var preview = CurvePreview.Create([new(30, 40), new(80, 80), new(100, 90)], 60);
+
+        Assert.Contains(new CurvePoint(55, 60), preview.Limited);
+        Assert.Contains(new CurvePoint(85, 82.5f), preview.Limited);
+        Assert.Contains(new CurvePoint(85, 100), preview.Limited);
+        Assert.Equal(new CurvePoint(125, 90), preview.Configured[^1]);
+        Assert.Equal(new CurvePoint(125, 100), preview.Limited[^1]);
+    }
+
+    [Fact]
+    public void PreviewKeepsConfiguredLineWhenFloorIsUnknown()
+    {
+        var points = Curve.DefaultPoints(ProfileKind.Quiet);
+        var preview = CurvePreview.Create(points, null);
+
+        Assert.Equal(points, preview.Configured[1..^1]);
+        Assert.Empty(preview.Limited);
+    }
 }

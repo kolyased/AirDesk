@@ -18,7 +18,16 @@ public record RestoreResult(bool Completed, bool Confirmed, string Detail);
 public record CoolingView(ChannelState State, string Reason, string Action, string Restore, string? Conflict,
     bool CanCalibrate, bool CanEnable, bool CanAdjust, bool CanRelease, bool CanRecover, bool CanSave,
     float? Floor, string? Group, string? Channel, float? Rpm, float? Command, ChannelIdentity? Identity, string? LastPollUtc, string? LastWriteUtc,
-    bool CanConfirm, float? Requested, float? Sent, string? Source, bool CanRename, bool NeedsRecovery);
+    bool CanConfirm, float? Requested, float? Sent, string? Source, bool CanRename, bool NeedsRecovery)
+{
+    public float? VerifiedFloor { get; init; }
+    public float? CpuTemperature { get; init; }
+    public float? CurveTemperature { get; init; }
+    public bool CurveCommandConfirmed { get; init; }
+    public bool TemperatureProtection { get; init; }
+    public bool? BiosRestoreConfirmed { get; init; }
+    internal FanProfile? ActiveProfile { get; init; }
+}
 
 public interface IFanController
 {
@@ -57,7 +66,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     volatile ChannelIdentity? captured;
     string lastAction = "", restoreStatus = "";
     string? conflict, fault;
-    float? command, requested, sentCommand;
+    float? command, requested, sentCommand, curveTemperature;
     string? sourceLabel;
     FanProfile profile = FanProfile.Default;
     readonly CurveResponse responsePolicy = new();
@@ -101,7 +110,16 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
             verified?.Floor ?? candidate?.Floor, verified?.Group ?? store.Saved?.Group, sample?.Identity?.Control,
             sample?.Rpm, command, sample?.Identity, LastPollUtc?.ToString("O"), LastWriteUtc?.ToString("O"),
             Idle && HardwareReady && SavedBinding?.Identity == sample!.Identity,
-            requested, sentCommand, sourceLabel, Idle && verified != null, store.RecoveryPending && captured == null);
+            requested, sentCommand, sourceLabel, Idle && verified != null, store.RecoveryPending && captured == null)
+        {
+            VerifiedFloor = verified?.Floor,
+            CpuTemperature = SafeCpu ? sample!.Cpu : null,
+            CurveTemperature = active && Fresh ? curveTemperature : null,
+            CurveCommandConfirmed = active && Fresh && mismatches == 0 && command.HasValue,
+            TemperatureProtection = active && Fresh && responsePolicy.TemperatureProtection,
+            BiosRestoreConfirmed = restoreStatus.Length > 0 && !restoring ? !restoreUncertain : null,
+            ActiveProfile = active ? profile : null
+        };
     }
 
     string UnavailableReason()
@@ -346,6 +364,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     {
         var (temperature, label) = profile.Kind == ProfileKind.Manual ? (sample!.Cpu, "CPU Package (защита)") : Resolve(profile);
         sourceLabel = label;
+        curveTemperature = temperature;
         if (!temperature.HasValue)
         {
             Interrupt("Потерян один из источников кривой: " + label, true);
@@ -371,6 +390,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
         mismatches = 0;
         sentCommand = requested = null;
         sourceLabel = null;
+        curveTemperature = null;
     }
 
     float Write(float target, bool emergency = false)

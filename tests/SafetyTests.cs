@@ -443,6 +443,35 @@ public sealed class SafetyTests
     }
 
     [Fact]
+    public void CurveFeedbackUsesResolvedSourceAndReportsIndependentCpuProtection()
+    {
+        var rig = Rig.Active();
+        rig.Safety.Adjust(FanProfile.Default with { Primary = Gpu });
+        rig.Observe(cpu: 85, gpu: 50, duty: rig.Output.Writes.Last());
+        rig.Safety.Tick();
+        var active = rig.Safety.View();
+
+        Assert.Equal(50, active.CurveTemperature);
+        Assert.Equal(65, active.VerifiedFloor);
+        Assert.Equal(100, active.Command);
+        Assert.True(active.TemperatureProtection);
+
+        rig.Observe(cpu: 84, gpu: 51, duty: 100);
+        rig.Safety.Tick();
+        Assert.True(rig.Safety.View().TemperatureProtection);
+
+        rig.Observe(cpu: 83, gpu: 52, duty: 100);
+        rig.Safety.Tick();
+        Assert.False(rig.Safety.View().TemperatureProtection);
+        Assert.Equal(100, rig.Safety.View().Command);
+
+        rig.Observe(gpu: null, duty: 100);
+        rig.Safety.Tick();
+        Assert.Null(rig.Safety.View().CurveTemperature);
+        Assert.False(rig.Safety.View().TemperatureProtection);
+    }
+
+    [Fact]
     public void TelemetryPreservesIdentityAndQuality()
     {
         var first = new Reading("RTX", "/gpu-nvidia/1", "GpuNvidia", "GPU Core", "Temperature", "°C", 76, "/gpu-nvidia/1/temperature/0", ReadingQuality.Fresh, DateTimeOffset.UtcNow);

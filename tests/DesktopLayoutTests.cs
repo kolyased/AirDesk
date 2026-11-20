@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Linq;
 using AirDesk;
 using Xunit;
@@ -45,4 +46,48 @@ public sealed class DesktopLayoutTests
         Check(DesktopLayout.Anchor(hidden, hidden, 960, 1079, 360, 280, 10) == (780, 790), "Auto-hide falls back to the closest screen edge");
     }
 
+    [Fact]
+    public void LiveTracePreservesMissingSamplesAndClearsWhenTheSourceChanges()
+    {
+        var trace = new LiveTrace();
+        var now = DateTimeOffset.UtcNow;
+        var a = new SensorReference("fan/1", "board", "Board");
+        var b = new SensorReference("fan/2", "board", "Board");
+        trace.Observe(now, a, 800);
+        trace.Observe(now.AddSeconds(1), null, null);
+        trace.Observe(now.AddSeconds(2), a, float.NaN);
+        trace.Observe(now.AddSeconds(3), a, 0);
+        Assert.Equal(new float?[] { 800, null, null, 0 }, trace.Points.Select(point => point.Value));
+        trace.Observe(now.AddSeconds(4), b, 1000);
+        Assert.Equal(1000f, Assert.Single(trace.Points).Value);
+        trace.Observe(now.AddMinutes(6), b, 900);
+        Assert.Equal(900f, Assert.Single(trace.Points).Value);
+    }
+
+    [Fact]
+    public void MonitorAndCompactSelectionsPersistWithLegacyDefaults()
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-layout-");
+        try
+        {
+            string file = Path.Combine(directory.FullName, "settings.json");
+            File.WriteAllText(file, "{\"SchemaVersion\":2}");
+            var legacy = UserPreferences.Load(file);
+            Assert.Equal(OverviewDetail.Default, legacy.OverviewDetails);
+            Assert.Equal(OverviewChart.Default, legacy.OverviewCharts);
+            Assert.Equal(DesktopLayout.DefaultCompactMetrics(), legacy.CompactMetrics);
+
+            legacy.OverviewDetails = OverviewDetail.GpuHotspot | (OverviewDetail)64;
+            legacy.OverviewCharts = OverviewChart.FanRpm;
+            legacy.CompactMetrics = [TrayMetric.FanRpm, TrayMetric.FanRpm, (TrayMetric)100];
+            legacy.OverviewFan = new("/fan/1", "/board", "Motherboard");
+            legacy.Save();
+            var saved = UserPreferences.Load(file);
+            Assert.Equal(OverviewDetail.GpuHotspot, saved.OverviewDetails);
+            Assert.Equal(OverviewChart.FanRpm, saved.OverviewCharts);
+            Assert.Equal(new[] { TrayMetric.FanRpm }, saved.CompactMetrics);
+            Assert.Equal(legacy.OverviewFan, saved.OverviewFan);
+        }
+        finally { directory.Delete(recursive: true); }
+    }
 }

@@ -101,6 +101,7 @@ internal sealed class CurveResponse
     TimeSpan last, startFall;
     bool falling;
     bool explicitChange, emergency;
+    public bool TemperatureProtection => emergency;
 
     public void Reset() { output = peakTemperature = null; falling = explicitChange = emergency = false; }
     public void ProfileChanged() { falling = false; explicitChange = true; }

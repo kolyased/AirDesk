@@ -41,6 +41,8 @@ internal sealed class FrameCapture : IDisposable
         run = Task.Run(() => ReadLoop(stop.Token));
     }
 
+    public string FilePath => path;
+    public int ProcessId => processId;
     public FrameRate? Current => Snapshot.Frames;
     public (FrameRate? Frames, string Status) Snapshot
     {

@@ -20,7 +20,11 @@ public sealed class UserPreferences
     public bool StartMinimized { get; set; }
     public bool WelcomeDismissed { get; set; }
     public CardSetting[] Cards { get; set; } = DesktopLayout.DefaultCards();
+    public OverviewDetail OverviewDetails { get; set; } = OverviewDetail.Default;
+    public OverviewChart OverviewCharts { get; set; } = OverviewChart.Default;
+    public SensorReference? OverviewFan { get; set; }
     public TrayMetric[] Tooltip { get; set; } = DesktopLayout.DefaultTooltip();
+    public TrayMetric[] CompactMetrics { get; set; } = DesktopLayout.DefaultCompactMetrics();
     public HistoryRetention Retention { get; set; }
     public SensorReference[]? HistorySensors { get; set; }
     public ThresholdRule[] Rules { get; set; } = [];
@@ -73,7 +77,11 @@ public sealed class UserPreferences
                 .ToList().ForEach(key => saved.Aliases.Remove(key));
             saved.Theme = Enum.IsDefined(saved.Theme) ? saved.Theme : Appearance.System;
             saved.Cards = DesktopLayout.NormalizeCards(saved.Cards);
+            saved.OverviewDetails &= OverviewDetail.All;
+            saved.OverviewCharts &= OverviewChart.All;
+            if (saved.OverviewFan is not { Id.Length: > 0, DeviceId.Length: > 0, DeviceName.Length: > 0 }) saved.OverviewFan = null;
             saved.Tooltip = (saved.Tooltip ?? DesktopLayout.DefaultTooltip()).Where(value => Enum.IsDefined(value)).Distinct().ToArray();
+            saved.CompactMetrics = (saved.CompactMetrics ?? DesktopLayout.DefaultCompactMetrics()).Where(value => Enum.IsDefined(value)).Distinct().ToArray();
             saved.Retention = Enum.IsDefined(saved.Retention) ? saved.Retention : HistoryRetention.Off;
             saved.HistorySensors = saved.HistorySensors?.Where(sensor => sensor is { Id.Length: > 0, DeviceId.Length: > 0, DeviceName.Length: > 0 })
                 .Distinct().ToArray();

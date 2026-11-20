@@ -7,12 +7,22 @@ namespace AirDesk;
 public enum Appearance { System, Dark, Light }
 public enum OverviewCard { Cpu, Gpu, Memory, Storage }
 public enum TrayMetric { CpuTemperature, CpuLoad, GpuTemperature, GpuLoad, MemoryLoad, FanRpm }
+[Flags]
+public enum OverviewDetail
+{
+    CpuTemperature = 1, GpuTemperature = 2, GpuHotspot = 4, MemoryCapacity = 8, StorageTemperature = 16,
+    Default = CpuTemperature | GpuTemperature | MemoryCapacity | StorageTemperature,
+    All = Default | GpuHotspot
+}
+[Flags]
+public enum OverviewChart { CpuLoad = 1, Temperatures = 2, FanRpm = 4, Default = Temperatures | FanRpm, All = CpuLoad | Default }
 public record CardSetting(OverviewCard Card, bool Visible);
 
 public static class DesktopLayout
 {
     public static CardSetting[] DefaultCards() => Enum.GetValues<OverviewCard>().Select(card => new CardSetting(card, true)).ToArray();
     public static TrayMetric[] DefaultTooltip() => [TrayMetric.CpuTemperature, TrayMetric.GpuTemperature];
+    public static TrayMetric[] DefaultCompactMetrics() => Enum.GetValues<TrayMetric>();
     public static int Columns(double width) => width >= 820 ? 4 : width >= 480 ? 2 : 1;
 
     public static CardSetting[] NormalizeCards(IEnumerable<CardSetting>? saved)

@@ -7,6 +7,7 @@ namespace AirDesk;
 
 public sealed partial class Dashboard
 {
+    FrameworkElement? frameSettingsPanel;
     readonly ListBox cardOrder = new() { Margin = new(0, 2, 0, 8) };
     readonly TextBlock startupStatus = Text("", 12);
     bool rebuildingCards, readingStartup;
@@ -24,6 +25,7 @@ public sealed partial class Dashboard
             if (theme.SelectedIndex < 0) return;
             preferences.Theme = (Appearance)theme.SelectedIndex; AppTheme.Apply(preferences.Theme); SavePreference();
         };
+        display.Children.Add(Button("FPS и OSD", () => frameSettingsPanel?.BringIntoView()));
         body.Children.Add(Surface(display, new Thickness(14), new Thickness(0, 0, 0, 12)));
 
         var overview = new StackPanel();
@@ -43,6 +45,31 @@ public sealed partial class Dashboard
             preferences.Cards = DesktopLayout.DefaultCards(); ReorderCards(); PopulateCardSettings(0); SavePreference();
         }));
         body.Children.Add(Surface(overview, new Thickness(14), new Thickness(0, 0, 0, 12)));
+
+        var readings = new StackPanel();
+        readings.Children.Add(monitorSettingsHeading);
+        AddWrapped(readings, "Выберите дополнительные значения в карточках и графики за последние пять минут.");
+        var details = new WrapPanel();
+        foreach (var (detail, label) in new[] { (OverviewDetail.CpuTemperature, "Температура CPU"), (OverviewDetail.GpuTemperature, "Температура ядра GPU"),
+            (OverviewDetail.GpuHotspot, "Горячая точка GPU"), (OverviewDetail.MemoryCapacity, "Объём памяти"), (OverviewDetail.StorageTemperature, "Температура дисков") })
+            details.Children.Add(DisplayCheck(label, preferences.OverviewDetails.HasFlag(detail), enabled =>
+            {
+                preferences.OverviewDetails = enabled ? preferences.OverviewDetails | detail : preferences.OverviewDetails & ~detail;
+                SavePreference();
+                if (displayed is { } data) UpdateMonitorCards(data, preferences.SelectedGpu(data), previousStale);
+            }));
+        readings.Children.Add(details);
+        readings.Children.Add(Text("Графики на главной", 14));
+        var charts = new WrapPanel();
+        foreach (var (chart, label) in new[] { (OverviewChart.Temperatures, "Температуры CPU и GPU"), (OverviewChart.FanRpm, "Обороты"), (OverviewChart.CpuLoad, "Загрузка CPU") })
+            charts.Children.Add(DisplayCheck(label, preferences.OverviewCharts.HasFlag(chart), enabled =>
+            {
+                preferences.OverviewCharts = enabled ? preferences.OverviewCharts | chart : preferences.OverviewCharts & ~chart;
+                SavePreference();
+                ApplyLiveGraphPreferences();
+            }));
+        readings.Children.Add(charts);
+        body.Children.Add(Surface(readings, new Thickness(14), new Thickness(0, 0, 0, 12)));
 
         var systemTray = new StackPanel();
         systemTray.Children.Add(Text("Трей и запуск", 19));
@@ -74,6 +101,17 @@ public sealed partial class Dashboard
         launch.Checked += (_, _) => SetStartup(); launch.Unchecked += (_, _) => SetStartup();
         minimized.Checked += (_, _) => SetMinimized(true); minimized.Unchecked += (_, _) => SetMinimized(false);
         LoadStartup();
+        systemTray.Children.Add(compactSettingsHeading);
+        var compact = new WrapPanel();
+        foreach (var metric in Enum.GetValues<TrayMetric>())
+            compact.Children.Add(DisplayCheck(TrayMetricName(metric), preferences.CompactMetrics.Contains(metric), enabled =>
+            {
+                preferences.CompactMetrics = enabled ? preferences.CompactMetrics.Append(metric).Distinct().ToArray() :
+                    preferences.CompactMetrics.Where(item => item != metric).ToArray();
+                SavePreference();
+                if (latest is { } current) RenderTray(current.Telemetry, current.Cooling, previousStale);
+            }));
+        systemTray.Children.Add(compact);
         systemTray.Children.Add(Text("Подсказка при наведении на значок", 15));
         var tooltip = new WrapPanel(); systemTray.Children.Add(tooltip);
         foreach (var metric in Enum.GetValues<TrayMetric>())
@@ -85,7 +123,8 @@ public sealed partial class Dashboard
         AddWrapped(systemTray, "Подсказка Windows вмещает только часть значений. Остальные доступны по щелчку по значку.");
         body.Children.Add(Surface(systemTray, new Thickness(14), new Thickness(0, 0, 0, 12)));
         body.Children.Add(BuildHistorySettings());
-        body.Children.Add(BuildFrameSettings());
+        frameSettingsPanel = BuildFrameSettings();
+        body.Children.Add(frameSettingsPanel);
         body.Children.Add(BuildUpdates());
         if (preferences.RecoveryNotice is { } notice) AddWrapped(body, notice);
         body.Children.Add(Button("Сбросить настройки…", () => _ = ResetPreferences()));
@@ -95,6 +134,14 @@ public sealed partial class Dashboard
             preferences.WelcomeDismissed = false; SavePreference(); welcome.Visibility = Visibility.Visible; Navigate(OverviewTab);
         }));
         return body;
+    }
+
+    static CheckBox DisplayCheck(string label, bool selected, Action<bool> set)
+    {
+        var check = new CheckBox { Content = label, IsChecked = selected, Margin = new(0, 3, 14, 8) };
+        check.Checked += (_, _) => set(true);
+        check.Unchecked += (_, _) => set(false);
+        return check;
     }
 
     void SetMinimized(bool minimized) { preferences.StartMinimized = minimized; SavePreference(); }

@@ -95,44 +95,57 @@ public sealed class DeviceReadings
     public Metric[] Details()
     {
         var items = new List<Metric>();
-        if (Temperature != null || Gpu || Disk || Type == "Cpu") items.Add(new("Температура", Temperature, Missing: ReadingQuality.NoSensor));
-        if (Load != null || Gpu || Disk || Type is "Cpu" or "Memory") items.Add(new("Нагрузка / активность", Load));
+        if (Temperature != null || Gpu || Disk || Type == "Cpu")
+            items.Add(new(Gpu ? "Температура ядра" : "Температура", Temperature, Section: "Температуры", Missing: ReadingQuality.NoSensor));
+        if (Gpu) items.Add(new("Горячая точка", Hotspot, Section: "Температуры", Missing: ReadingQuality.NoSensor));
+        if (Load != null || Gpu || Disk || Type is "Cpu" or "Memory")
+            items.Add(new(Disk ? "Активность" : "Загрузка", Load, Section: "Нагрузка"));
         if (Gpu)
         {
-            items.Add(new("Горячая точка", Hotspot, Missing: ReadingQuality.NoSensor));
-            items.Add(new("VRAM занято", MemoryUsed));
-            items.Add(new("VRAM всего", VramTotal));
+            items.Add(new("Занято", MemoryUsed, Section: "Видеопамять (VRAM)"));
+            items.Add(new("Всего", VramTotal, Section: "Видеопамять (VRAM)"));
         }
         if (Id == "/ram")
         {
-            items.Add(new("Используется", MemoryUsed));
-            items.Add(new("Всего", null, MemoryTotal, "ГБ"));
+            var used = MemoryUsed;
+            var free = Get("/data/1");
+            var failure = used is { Available: false } ? used : free;
+            items.Add(new("Используется", used, Section: "Объём памяти"));
+            items.Add(new("Всего", null, MemoryTotal, "ГБ", "Объём памяти",
+                failure is { Available: false } ? failure.Quality : ReadingQuality.Unsupported));
         }
         if (Type is "Cpu" or "Memory" || Gpu)
         {
-            items.AddRange(Readings.Where(r => r.Kind == "Clock" || r.Kind == "Power" || Type == "Memory" && r.Kind == "Temperature")
-                .Select(r => new Metric(r.Name, r)));
-            if (!Readings.Any(r => r.Kind == "Clock")) items.Add(new("Частота", null));
-            if ((Gpu || Type == "Cpu") && !Readings.Any(r => r.Kind == "Power")) items.Add(new("Потребление", null));
-            if (Type == "Memory" && !Readings.Any(r => r.Kind == "Temperature")) items.Add(new("Температура памяти", null, Missing: ReadingQuality.NoSensor));
+            AddKind("Clock", "Частоты", "Частота");
+            if (Gpu || Type == "Cpu" || Readings.Any(r => r.Kind == "Power")) AddKind("Power", "Мощность", "Потребление");
+            if (Type == "Memory") AddKind("Temperature", "Температуры", "Температура памяти", ReadingQuality.NoSensor);
         }
         if (Disk)
         {
-            items.Add(new("Чтение", Named("Throughput", "Read Rate", "Read Speed")));
-            items.Add(new("Запись", Named("Throughput", "Write Rate", "Write Speed")));
-            items.Add(new("Оставшийся ресурс SMART", SmartPercent("Life", "Remaining Life", "SSD Life Left")));
+            items.Add(new("Чтение", Named("Throughput", "Read Rate", "Read Speed"), Section: "Передача данных"));
+            items.Add(new("Запись", Named("Throughput", "Write Rate", "Write Speed"), Section: "Передача данных"));
+            items.AddRange(Readings.Where(r => r.Kind == "Data" && (r.Name == "Data Read" || r.Name == "Data Written"))
+                .Select(r => new Metric(r.Name, r, Section: "Передача данных")));
+            items.Add(new("Оставшийся ресурс SMART", SmartPercent("Life", "Remaining Life", "SSD Life Left"), Section: "Ресурс накопителя"));
             if (Id.StartsWith("/nvme/", StringComparison.Ordinal))
             {
-                items.Add(new("Использованный ресурс NVMe", SmartPercent("Percentage Used", allowAbove100: true)));
-                items.Add(new("Доступный резерв NVMe", SmartPercent("Available Spare")));
-                items.Add(new("Порог резерва NVMe", SmartPercent("Available Spare Threshold")));
+                items.Add(new("Использованный ресурс NVMe", SmartPercent("Percentage Used", allowAbove100: true), Section: "Ресурс накопителя"));
+                items.Add(new("Доступный резерв NVMe", SmartPercent("Available Spare"), Section: "Ресурс накопителя"));
+                items.Add(new("Порог резерва NVMe", SmartPercent("Available Spare Threshold"), Section: "Ресурс накопителя"));
             }
-            items.AddRange(Readings.Where(r => r.Kind == "Data" && (r.Name == "Data Read" || r.Name == "Data Written")).Select(r => new Metric(r.Name, r)));
         }
         if (Type is "Motherboard" or "SuperIO")
             items.AddRange(Readings.Where(r => r.Kind is "Voltage" or "Temperature" or "Fan" or "Control")
                 .Select(r => new Metric(r.Name, r, Section: BoardSection(r))).OrderBy(metric => metric.Section, StringComparer.CurrentCulture));
+        if (items.Count == 0) items.AddRange(Readings.Select(r => new Metric(r.Name, r, Section: "Показания")));
         return items.ToArray();
+
+        void AddKind(string kind, string section, string placeholder, ReadingQuality missing = ReadingQuality.Unsupported)
+        {
+            int previous = items.Count;
+            items.AddRange(Readings.Where(r => r.Kind == kind).Select(r => new Metric(r.Name, r, Section: section)));
+            if (items.Count == previous) items.Add(new(placeholder, null, Section: section, Missing: missing));
+        }
     }
 
     Reading? SmartPercent(params string[] labels) => SmartPercent(false, labels);
