@@ -53,7 +53,7 @@ public sealed partial class Dashboard
         var disk = data.Disks.Where(device => LiveValue(device.Temperature, stale).HasValue)
             .MaxBy(device => LiveValue(device.Temperature, stale));
         float? storage = data.Disks.Select(device => LiveValue(device.Load, stale)).DefaultIfEmpty().Max();
-        Set(OverviewCard.Cpu, viewModel.Cpu, LiveValue(data.Cpu?.Load, stale), fields.HasFlag(OverviewDetail.CpuTemperature)
+        Set(OverviewCard.Cpu, cpuMetric, LiveValue(data.Cpu?.Load, stale), fields.HasFlag(OverviewDetail.CpuTemperature)
             ? "Температура · " + ValueStatus(data.Cpu?.Temperature, stale, "°C") : "");
 
         var gpuInfo = new List<string>(3);
@@ -61,14 +61,14 @@ public sealed partial class Dashboard
         if (fields.HasFlag(OverviewDetail.GpuHotspot)) gpuInfo.Add("Горячая точка · " + ValueStatus(gpu?.Hotspot, stale, "°C"));
         if (gpu != null) gpuInfo.Add(preferences.DeviceLabel(gpu.Id, gpu.Name, gpu.InstanceId));
         else if (preferences.Gpu != null) gpuInfo.Add("Выбранная видеокарта недоступна");
-        Set(OverviewCard.Gpu, viewModel.Gpu, LiveValue(gpu?.Load, stale), string.Join("\n", gpuInfo));
+        Set(OverviewCard.Gpu, gpuMetric, LiveValue(gpu?.Load, stale), string.Join("\n", gpuInfo));
 
         string memory = fields.HasFlag(OverviewDetail.MemoryCapacity)
             ? LiveValue(data.Ram?.MemoryUsed, stale) is float used && data.Ram?.MemoryTotal is float total
                 ? $"{used:0.#} / {total:0.#} ГБ" : "Объём · нет данных"
             : "";
-        Set(OverviewCard.Memory, viewModel.Memory, LiveValue(data.Ram?.Load, stale), memory);
-        Set(OverviewCard.Storage, viewModel.Storage, storage, fields.HasFlag(OverviewDetail.StorageTemperature)
+        Set(OverviewCard.Memory, memoryMetric, LiveValue(data.Ram?.Load, stale), memory);
+        Set(OverviewCard.Storage, storageMetric, storage, fields.HasFlag(OverviewDetail.StorageTemperature)
             ? disk == null ? "Температура · нет данных" : $"{Format(disk.Temperature?.Value, "°C")} · {preferences.Label(disk.Id, disk.Name)}" : "");
         cards[OverviewCard.Cpu].ToolTip = CardHint("Загрузка", data.Cpu?.Load, "Температура", data.Cpu?.Temperature, stale);
         cards[OverviewCard.Gpu].ToolTip = CardHint("Загрузка", gpu?.Load, "Температура ядра", gpu?.Temperature, stale);

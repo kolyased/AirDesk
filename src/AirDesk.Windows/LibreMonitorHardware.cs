@@ -6,18 +6,11 @@ using LibreHardwareMonitor.Hardware.Gpu;
 
 namespace AirDesk;
 
-public record SensorPoll(Telemetry Telemetry, int UpdatedDevices, int DeferredDevices, int FailedDevices);
-
-public interface ISensorProvider : IDisposable
-{
-    void Open();
-    SensorPoll Poll(TimeSpan elapsed, bool discover);
-}
-
 // All methods run on the same hardware executor as firmware writes.
-internal sealed class LibreSensorProvider(WindowsCooling cooling) : ISensorProvider
+internal sealed class LibreMonitorHardware : IMonitorHardware
 {
     sealed record Frame(Reading[] Readings, TimeSpan Next, bool Failed);
+    readonly WindowsCooling cooling = new();
     readonly Computer computer = new() { IsCpuEnabled = true, IsMotherboardEnabled = true, IsMemoryEnabled = true,
         IsGpuEnabled = true, IsStorageEnabled = true };
     readonly Dictionary<IHardware, Frame> frames = new();
@@ -28,7 +21,8 @@ internal sealed class LibreSensorProvider(WindowsCooling cooling) : ISensorProvi
 
     public void Open()
     {
-        computer.Open(); opened = true;
+        opened = true;
+        computer.Open();
         Enumerate(); nextEnumeration = TimeSpan.FromSeconds(10);
         cooling.Discover(devices);
     }
@@ -142,5 +136,19 @@ internal sealed class LibreSensorProvider(WindowsCooling cooling) : ISensorProvi
             foreach (var item in Walk(child)) yield return item;
     }
 
-    public void Dispose() { if (opened) { opened = false; computer.Close(); } }
+    public bool RetryDiscovery => cooling.RetryDiscovery;
+    public FanSample Sample(Telemetry telemetry) => cooling.Sample(telemetry);
+    public void Acquire() => cooling.Acquire();
+    public float? Write(float percent, Action guard) => cooling.Write(percent, guard);
+    public RestoreResult Restore() => cooling.Restore();
+    public void ReleaseLease() => cooling.ReleaseLease();
+
+    public void Dispose()
+    {
+        try
+        {
+            if (opened) { opened = false; computer.Close(); }
+        }
+        finally { cooling.Dispose(); }
+    }
 }

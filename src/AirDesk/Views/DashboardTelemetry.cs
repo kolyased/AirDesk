@@ -251,6 +251,7 @@ public sealed partial class Dashboard
             ? $"{id.BoardVendor} {id.Board} {id.Revision} · BIOS {id.Firmware} · {id.Driver} · LHM {id.Library} · определение {id.Definition}\n{id.Chip} · {id.Control} ↔ {id.Tachometer} · CPU {id.Temperature}"
             : cooling?.Reason ?? "Оборудование ещё не опрошено.";
         if (previousStale) diagnosticStatus.Text += "\nПоследний снимок устарел. Проверьте, возобновился ли опрос после сна Windows.";
+        if (viewModel.Failure is { } failure) diagnosticStatus.Text += $"\n{failure}";
         if (latest?.PollIssue is { } issue) diagnosticStatus.Text += $"\n{issue}";
         if (latest?.Polling is { } stats)
             diagnosticStatus.Text += $"\nОпрос {stats.LastMilliseconds:0.#} мс, среднее {stats.AverageMilliseconds:0.#}, пик {stats.PeakMilliseconds:0.#}. Циклы {stats.Polls}; пропущено {stats.MissedCycles}." +

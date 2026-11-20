@@ -187,6 +187,11 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
 
     public void Tick()
     {
+        if (restoring)
+        {
+            RestoreIfDue();
+            return;
+        }
         // Sensor polls and scheduled ticks can arrive together. Only idle ticks share a recent result.
         if (captured != null || nextIdleScan is not { } due || clock() >= due)
         {
@@ -205,6 +210,11 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
             else if (testing && testingFloor && clock() >= testEnd - TimeSpan.FromSeconds(5)) RaiseTestSpeed();
             else if (active) ApplyProfile();
         }
+        RestoreIfDue();
+    }
+
+    internal void RestoreIfDue()
+    {
         if (restoring && clock() >= restoreAt) RestoreStep();
     }
 
@@ -453,14 +463,25 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     public void InvalidateForPowerChange()
     {
         nextIdleScan = null;
+        ClearSample();
+        if (captured != null)
+            SetAction("Изменилось состояние питания Windows. Запрошен возврат BIOS/EC. После пробуждения проверьте привязку заново.");
+        BeginRestore();
+    }
+
+    internal void InvalidateSample(string reason)
+    {
+        if (captured != null) Interrupt(reason, true);
+        ClearSample();
+    }
+
+    void ClearSample()
+    {
         sample = null;
         lastPoll = null;
         LastPollUtc = null;
         baseline.Clear();
         verified = candidate = null;
-        if (captured != null)
-            SetAction("Изменилось состояние питания Windows. Запрошен возврат BIOS/EC. После пробуждения проверьте привязку заново.");
-        BeginRestore();
     }
 
     public void AcknowledgeRecovery()

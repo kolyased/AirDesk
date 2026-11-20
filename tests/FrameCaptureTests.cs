@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading.Tasks;
 using AirDesk;
 using Xunit;
@@ -10,6 +11,7 @@ public sealed class FrameCaptureTests
 {
     const string Header = "ProcessID,SwapChainAddress,msBetweenPresents\n";
     const string Rows = "42,A,20\n42,A,20\n";
+    const string SlowerRows = "42,A,40\n42,A,40\n";
 
     [Fact]
     public async Task LiveCsvReportsStoppedWriterAndResumesWhenRowsReturn()
@@ -18,8 +20,8 @@ public sealed class FrameCaptureTests
         using var capture = new FrameCapture(fixture.Path, 42);
         await WaitFor(() => capture.Snapshot.Status.Contains("Ожидание новых кадров", StringComparison.Ordinal));
         Assert.Null(capture.Current);
-        await File.AppendAllTextAsync(fixture.Path, Rows);
-        await WaitFor(() => capture.Current?.FramesPerSecond == 50);
+        await File.AppendAllTextAsync(fixture.Path, SlowerRows);
+        await WaitFor(() => capture.Current?.FramesPerSecond == 25);
         await WaitFor(() => capture.Current == null);
         Assert.Contains("консоли PresentMon", capture.Snapshot.Status);
 
@@ -48,6 +50,12 @@ public sealed class FrameCaptureTests
         await File.WriteAllTextAsync(fixture.Path, "");
         await WaitFor(() => capture.Snapshot.Status.Contains("полного заголовка", StringComparison.Ordinal));
         Assert.Null(capture.Current);
+
+        await File.WriteAllTextAsync(fixture.Path, Header + Rows);
+        await WaitFor(() => capture.Snapshot.Status.Contains("Ожидание новых кадров", StringComparison.Ordinal));
+        Assert.Null(capture.Current);
+        await File.AppendAllTextAsync(fixture.Path, SlowerRows);
+        await WaitFor(() => capture.Current?.FramesPerSecond == 25);
     }
 
     [Fact]
@@ -61,13 +69,13 @@ public sealed class FrameCaptureTests
 
         using (var writer = await LockForAppend(fixture.Path))
         {
-            await writer.WriteAsync(System.Text.Encoding.UTF8.GetBytes(Rows));
+            await writer.WriteAsync(Encoding.UTF8.GetBytes(SlowerRows));
             await WaitFor(() => capture.Snapshot.Status.Contains("прочитать CSV", StringComparison.Ordinal));
             Assert.Null(capture.Current);
             if (OperatingSystem.IsWindows()) Assert.Contains("--output_stdout", capture.Snapshot.Status);
         }
 
-        await WaitFor(() => capture.Current?.FramesPerSecond == 50);
+        await WaitFor(() => capture.Current?.FramesPerSecond == 25);
     }
 
     [Fact]
@@ -116,6 +124,36 @@ public sealed class FrameCaptureTests
         await WaitFor(() => capture.Snapshot.Status.Contains("Ожидание новых кадров", StringComparison.Ordinal));
         await File.AppendAllTextAsync(fixture.Path, "A,42,40\nA,42,40\n");
         await WaitFor(() => capture.Current?.FramesPerSecond == 25);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SameHeaderRewriteDoesNotReplayExistingRows(bool replaceFile)
+    {
+        using var fixture = new CsvFixture(Header);
+        using var capture = new FrameCapture(fixture.Path, 42);
+        await WaitFor(() => capture.Snapshot.Status.Contains("Ожидание новых кадров", StringComparison.Ordinal));
+        await File.AppendAllTextAsync(fixture.Path, Rows);
+        await WaitFor(() => capture.Current?.FramesPerSecond == 50);
+
+        string rewrittenCsv = Header + SlowerRows + SlowerRows;
+        if (replaceFile)
+        {
+            using var replacement = new CsvFixture(rewrittenCsv);
+            if (OperatingSystem.IsWindows())
+                File.SetCreationTimeUtc(replacement.Path, File.GetCreationTimeUtc(fixture.Path));
+            File.Move(replacement.Path, fixture.Path, overwrite: true);
+        }
+        else
+        {
+            await File.WriteAllTextAsync(fixture.Path, rewrittenCsv);
+        }
+
+        await WaitFor(() => capture.Snapshot.Status.Contains("Ожидание новых кадров", StringComparison.Ordinal));
+        Assert.Null(capture.Current);
+        await File.AppendAllTextAsync(fixture.Path, "42,A,10\n42,A,10\n");
+        await WaitFor(() => capture.Current?.FramesPerSecond == 100);
     }
 
     [Fact]

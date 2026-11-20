@@ -17,6 +17,7 @@ internal sealed class FrameCapture : IDisposable
     const string WaitingForHeader = "CSV PresentMon ещё не содержит полного заголовка. " + CheckPresentMon;
     readonly CancellationTokenSource stop = new();
     readonly byte[] buffer = new byte[8192];
+    readonly byte[] tail = new byte[64];
     readonly List<byte> partial = new(256);
     readonly string path;
     readonly int processId;
@@ -24,6 +25,7 @@ internal sealed class FrameCapture : IDisposable
     byte[] header = [];
     PresentMonFrames? parser;
     long offset;
+    int tailLength;
     bool discardLine;
     DateTime stamp;
     int disposed;
@@ -99,7 +101,8 @@ internal sealed class FrameCapture : IDisposable
         long end = stream.Length;
         // On Unix, creation time can be synthesized from timestamps that change on append.
         DateTime created = OperatingSystem.IsWindows() ? File.GetCreationTimeUtc(stream.SafeFileHandle) : default;
-        if (parser == null || created != stamp || end < offset || !await HasSameHeader(stream, cancel).ConfigureAwait(false))
+        if (parser == null || created != stamp || end < offset ||
+            !await HasSameHeader(stream, cancel).ConfigureAwait(false) || !await HasSameTail(stream, cancel).ConfigureAwait(false))
         {
             parser = null;
             stream.Position = 0;
@@ -114,9 +117,9 @@ internal sealed class FrameCapture : IDisposable
             }
             var newParser = new PresentMonFrames(Encoding.UTF8.GetString(buffer, 0, newline).TrimEnd('\r'));
             var newHeader = buffer.AsSpan(0, newline + 1).ToArray();
-            stream.Position = end - 1;
-            int last = stream.ReadByte();
-            if (last < 0)
+            int length = (int)Math.Min(tail.Length, end);
+            stream.Position = end - length;
+            if (await stream.ReadAtLeastAsync(tail.AsMemory(0, length), length, false, cancel).ConfigureAwait(false) != length)
             {
                 latest = new(null, 0, WaitingForHeader);
                 return;
@@ -125,7 +128,8 @@ internal sealed class FrameCapture : IDisposable
             header = newHeader;
             latest = new(null, Environment.TickCount64, null);
             offset = end;
-            discardLine = last != '\n';
+            tailLength = length;
+            discardLine = tail[tailLength - 1] != '\n';
             partial.Clear();
             stamp = created;
             return;
@@ -135,6 +139,7 @@ internal sealed class FrameCapture : IDisposable
         if (end - offset > MaxBatch)
         {
             offset = end - MaxBatch;
+            tailLength = 0;
             partial.Clear();
             discardLine = true;
         }
@@ -147,6 +152,7 @@ internal sealed class FrameCapture : IDisposable
             if (count == 0) break;
             remaining -= count;
             offset += count;
+            RememberTail(buffer.AsSpan(0, count));
             for (int index = 0; index < count; index++)
             {
                 byte value = buffer[index];
@@ -185,6 +191,23 @@ internal sealed class FrameCapture : IDisposable
     {
         int count = await stream.ReadAtLeastAsync(buffer.AsMemory(0, header.Length), header.Length, false, cancel).ConfigureAwait(false);
         return count == header.Length && buffer.AsSpan(0, count).SequenceEqual(header);
+    }
+
+    async ValueTask<bool> HasSameTail(FileStream stream, CancellationToken cancel)
+    {
+        // Truncation followed by a rewrite can preserve the header and grow past the last offset.
+        stream.Position = offset - tailLength;
+        int count = await stream.ReadAtLeastAsync(buffer.AsMemory(0, tailLength), tailLength, false, cancel).ConfigureAwait(false);
+        return count == tailLength && buffer.AsSpan(0, count).SequenceEqual(tail.AsSpan(0, tailLength));
+    }
+
+    void RememberTail(ReadOnlySpan<byte> bytes)
+    {
+        if (bytes.Length > tail.Length) bytes = bytes[^tail.Length..];
+        int retained = Math.Min(tailLength, tail.Length - bytes.Length);
+        tail.AsSpan(tailLength - retained, retained).CopyTo(tail);
+        bytes.CopyTo(tail.AsSpan(retained));
+        tailLength = retained + bytes.Length;
     }
 
     public void Dispose()

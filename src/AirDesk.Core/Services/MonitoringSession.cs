@@ -1,44 +1,24 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.Threading.Tasks;
-using System.Windows.Input;
 
 namespace AirDesk;
 
-internal sealed class DisplayMetric : INotifyPropertyChanged
-{
-    public event PropertyChangedEventHandler? PropertyChanged;
-    public string Value { get; private set; } = "—";
-    public string Detail { get; private set; } = "Ожидание показаний";
-
-    public void Set(string value, string detail)
-    {
-        if (Value != value) { Value = value; PropertyChanged?.Invoke(this, new(nameof(Value))); }
-        if (Detail != detail) { Detail = detail; PropertyChanged?.Invoke(this, new(nameof(Detail))); }
-    }
-}
-
-internal sealed class DashboardViewModel
+internal sealed class MonitoringSession
 {
     readonly Monitor executor;
     readonly ThresholdEvaluator thresholds = new();
     readonly ConcurrentQueue<string> alerts = new();
     volatile ThresholdRule[] rules = [];
     public HistoryStore History { get; }
-    public ICommand ReleaseCommand { get; }
     public Snapshot? Latest => executor.Latest;
     public bool Stalled => executor.Stalled;
-    public DisplayMetric Cpu { get; } = new();
-    public DisplayMetric Gpu { get; } = new();
-    public DisplayMetric Memory { get; } = new();
-    public DisplayMetric Storage { get; } = new();
+    public string? Failure => executor.Failure;
 
-    public DashboardViewModel(bool monitorOnly, string? historyFolder = null)
+    public MonitoringSession(Monitor executor, string? historyFolder = null)
     {
-        executor = new Monitor(monitorOnly);
-        ReleaseCommand = new ReleaseRequest(executor.Release);
+        this.executor = executor;
         History = new HistoryStore(historyFolder);
         executor.Sampled = (telemetry, now) =>
         {
@@ -61,7 +41,7 @@ internal sealed class DashboardViewModel
     }
 
     public void Start() => executor.Start();
-    public void Release() => ReleaseCommand.Execute(null);
+    public void Release() => executor.Release();
     public void PowerChanged(bool isSuspending) => executor.PowerChanged(isSuspending);
     public Task<string> SaveCalibration() => executor.Submit(safety => safety.SaveCalibration());
     public Task<string> ConfirmTopology() => executor.Submit(safety => safety.ConfirmUnchangedTopology());
@@ -81,10 +61,4 @@ internal sealed class DashboardViewModel
         }
     }
 
-    sealed class ReleaseRequest(Action release) : ICommand
-    {
-        public event EventHandler? CanExecuteChanged { add { } remove { } }
-        public bool CanExecute(object? parameter) => true;
-        public void Execute(object? parameter) => release();
-    }
 }

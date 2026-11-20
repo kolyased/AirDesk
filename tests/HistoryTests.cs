@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -101,6 +102,204 @@ public sealed class HistoryTests(ITestOutputHelper output)
         Check(HistoryModel.Compact(raw, now, HistoryRetention.Hour).Single().At == now, "Expired points rotate out");
         var many = Enumerable.Range(0, HistoryModel.MaxPoints + 100).Select(i => Point(now.AddMilliseconds(-i * 10), 40));
         Check(HistoryModel.Compact(many, now, HistoryRetention.Hour).Length == HistoryModel.MaxPoints, "History stays bounded even on short intervals");
+    }
+
+    [Fact]
+    public void RetentionIncludesTheExactCutoffAndDropsAggregatesThatStartBeforeIt()
+    {
+        var now = DateTimeOffset.Parse("2026-11-18T15:40:00Z");
+        var cutoff = now.AddHours(-1);
+        var expired = TemperaturePoint(cutoff.AddTicks(-1));
+        var overlap = TemperaturePoint(cutoff.AddSeconds(5)) with { From = cutoff.AddSeconds(-5), Count = 2 };
+        var boundary = TemperaturePoint(cutoff);
+        var newer = TemperaturePoint(cutoff.AddTicks(1));
+
+        var retained = HistoryModel.Compact([newer, expired, overlap, boundary], now, HistoryRetention.Hour);
+
+        Assert.Equal(new[] { boundary, newer }, retained);
+        Assert.Equal((cutoff, newer.At), HistoryModel.RecordedRange(retained));
+    }
+
+    [Fact]
+    public async Task ReducingRetentionTrimsTheSavedArchiveAndUpdatesItsRecordedRange()
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            var expired = TemperaturePoint(now.AddHours(-2));
+            var overlap = TemperaturePoint(now.AddMinutes(-55)) with { From = now.AddMinutes(-65), Count = 2 };
+            var recent = TemperaturePoint(now.AddMinutes(-50));
+            var latest = TemperaturePoint(now);
+            string path = Path.Combine(directory.FullName, "history-v2.json.gz");
+            WriteHistory(path, [expired, overlap, recent, latest]);
+
+            var store = new HistoryStore(directory.FullName);
+            Assert.Equal(4, (await store.ReadAsync()).Length);
+            Assert.Equal((expired.From, latest.At), store.SavedRange);
+            store.Configure(HistoryRetention.Day);
+            await store.FlushAsync();
+            store.Configure(HistoryRetention.Hour);
+            await store.StopAsync();
+
+            Assert.Equal((recent.From, latest.At), store.SavedRange);
+            var restarted = new HistoryStore(directory.FullName);
+            Assert.Equal(new[] { recent, latest }, await restarted.ReadAsync());
+            Assert.Equal(store.SavedRange, restarted.SavedRange);
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Fact]
+    public async Task HistoryPointLimitKeepsTheNewestRowsOnDisk()
+    {
+        const int pointLimit = 96_000;
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            var seedStart = now.AddMinutes(-5);
+            var seed = Enumerable.Range(0, pointLimit).Select(i => TemperaturePoint(seedStart.AddMilliseconds(i))).ToArray();
+            WriteHistory(Path.Combine(directory.FullName, "history-v2.json.gz"), seed);
+
+            var store = new HistoryStore(directory.FullName);
+            Assert.Equal(pointLimit, (await store.ReadAsync()).Length);
+            store.Configure(HistoryRetention.Hour);
+            store.Offer(new Telemetry([DiskTemperature(0, now) with { Value = 45 }]), now);
+            await store.StopAsync();
+
+            var restarted = new HistoryStore(directory.FullName);
+            var retained = await restarted.ReadAsync();
+            Assert.Equal(pointLimit, retained.Length);
+            Assert.Equal(seed[1], retained[0]);
+            Assert.Equal(TemperaturePoint(now) with { Mean = 45, Min = 45, Max = 45 }, retained[^1]);
+            Assert.Equal((seed[1].At, now), restarted.SavedRange);
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Fact]
+    public async Task HistoryByteLimitDropsOldestRowsAndKeepsAReadableJournal()
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            var random = new Random(9174);
+            var bytes = new byte[1_100_000];
+            var readings = Enumerable.Range(0, 16).Select(i =>
+            {
+                random.NextBytes(bytes);
+                return DiskTemperature(i, now.AddSeconds(i - 16)) with { Name = Convert.ToBase64String(bytes), Value = i };
+            }).ToArray();
+            var store = new HistoryStore(directory.FullName);
+            await store.ReadAsync();
+            store.Configure(HistoryRetention.Hour, readings.Select(reading => reading.Reference));
+            store.Offer(new Telemetry(readings), now);
+            await store.StopAsync();
+
+            string path = Path.Combine(directory.FullName, "history-v2.json.gz");
+            Assert.InRange(new FileInfo(path).Length, 1L, 16L * 1024 * 1024);
+            var restarted = new HistoryStore(directory.FullName);
+            var retained = await restarted.ReadAsync();
+            Assert.InRange(retained.Length, 1, readings.Length - 1);
+            Assert.Equal(Enumerable.Range(readings.Length - retained.Length, retained.Length).Select(i => (float)i),
+                retained.Select(point => point.Mean));
+            Assert.Equal((readings[^retained.Length].UpdatedAt!.Value, readings[^1].UpdatedAt!.Value), store.SavedRange);
+            Assert.Equal(store.SavedRange, restarted.SavedRange);
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Theory]
+    [InlineData(CompressionLevel.NoCompression, 16 * 1024 * 1024, true)]
+    [InlineData(CompressionLevel.Fastest, 64 * 1024 * 1024, false)]
+    public void CompressedJournalRejectsOversizedInput(CompressionLevel compression, int padding, bool exceedsFileLimit)
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "history-v2.json.gz");
+            using (var file = File.Create(path))
+            using (var gzip = new GZipStream(file, compression))
+            {
+                gzip.Write("{\"Version\":2,\"Series\":[]}"u8);
+                WriteWhitespace(gzip, padding);
+            }
+
+            Assert.Equal(exceedsFileLimit, new FileInfo(path).Length > 16L * 1024 * 1024);
+            Assert.Throws<InvalidDataException>(() => HistoryJournal.Read(path));
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Fact]
+    public void LegacyJournalRejectsOversizedInput()
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "history-v1.json");
+            using (var file = File.Create(path))
+            {
+                file.Write("{\"Version\":1,\"Points\":[]}"u8);
+                WriteWhitespace(file, 4 * 1024 * 1024);
+            }
+
+            Assert.Throws<InvalidDataException>(() => HistoryJournal.ReadLegacy(path));
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Fact]
+    public void CompressedJournalRejectsInputAboveThePointLimit()
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "history-v2.json.gz");
+            using (var file = File.Create(path))
+            using (var gzip = new GZipStream(file, CompressionLevel.Fastest))
+            using (var json = new StreamWriter(gzip))
+            {
+                json.Write("""{"Version":2,"Series":[{"Sensor":{"Id":"/disk/0/temperature/0","DeviceId":"/disk/0","DeviceName":"Disk"},"Name":"Temperature","Unit":"°C","Samples":[""");
+                for (int i = 0; i < 96_001; i++)
+                {
+                    if (i != 0) json.Write(',');
+                    json.Write("""{"From":639307872000000000,"At":639307872000000000,"Mean":40,"Min":40,"Max":40,"Count":1,"Interval":10}""");
+                }
+                json.Write("]}]}");
+            }
+
+            Assert.Throws<InvalidDataException>(() => HistoryJournal.Read(path));
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    static HistoryPoint TemperaturePoint(DateTimeOffset at)
+    {
+        var sensor = DiskTemperature(0, at);
+        return new(sensor.Reference, sensor.Name, sensor.Unit, at, at, 40, 40, 40, 1, 10);
+    }
+
+    static void WriteHistory(string path, HistoryPoint[] points)
+    {
+        using var encoded = new MemoryStream();
+        Assert.True(HistoryJournal.TryEncode(points, encoded));
+        using var file = File.Create(path);
+        encoded.CopyTo(file);
+    }
+
+    static void WriteWhitespace(Stream stream, int bytes)
+    {
+        Span<byte> spaces = stackalloc byte[16 * 1024];
+        spaces.Fill((byte)' ');
+        while (bytes > 0)
+        {
+            int count = Math.Min(bytes, spaces.Length);
+            stream.Write(spaces[..count]);
+            bytes -= count;
+        }
     }
 
     [Fact]

@@ -95,7 +95,7 @@ internal sealed class HistoryStore
             var sources = sensors == null ? telemetry.HistorySources : telemetry.HistoryCandidates;
             foreach (var reading in sources)
             {
-                var sensor = sensors == null ? reading.Reference : telemetry.PersistentReference(reading);
+                var sensor = telemetry.PersistentReference(reading);
                 if (sensors != null && !sensors.Contains(sensor)) continue;
                 if (reading is not { Available: true, Value: float value, UpdatedAt: { } time } ||
                     !float.IsFinite(value) || time > now.AddMinutes(1) ||

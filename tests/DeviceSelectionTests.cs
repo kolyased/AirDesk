@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 using AirDesk;
 using Xunit;
@@ -43,6 +44,75 @@ public sealed class DeviceSelectionTests
         Assert.Null(Curve.Resolve(FanProfile.Default with { Primary = Gpu(1, 70).Reference }, 35, singleGpu.CurveSources).Temperature);
         Assert.Equal(71f, Curve.Resolve(FanProfile.Default with { Primary = hotGpu }, 35, singleGpu.CurveSources).Temperature);
         Assert.Empty(new Telemetry([Gpu(1, 71)]).CurveSources);
+    }
+
+    [Fact]
+    public void SameNamedSensorsKeepDistinctReferencesAcrossGpuIndexChanges()
+    {
+        var primary = Gpu(0, 40, First);
+        var secondary = primary with { Id = primary.DeviceId + "/temperature/1", Value = 53 };
+        var original = new Telemetry([primary, secondary, Gpu(1, 70, Second)]);
+
+        var moved = Gpu(1, 41, First);
+        var movedSecondary = moved with { Id = moved.DeviceId + "/temperature/1", Value = 54 };
+        var reordered = new Telemetry([Gpu(0, 71, Second), movedSecondary, moved]);
+        var sources = reordered.HistoryCandidates.ToDictionary(reordered.PersistentReference);
+        Assert.Equal(3, sources.Count);
+        Assert.Equal(41f, sources[original.PersistentReference(primary)].Value);
+        Assert.Equal(54f, sources[original.PersistentReference(secondary)].Value);
+        Assert.Equal(41f, reordered.PrimaryGpu(primary.DeviceId, First)?.Temperature?.Value);
+    }
+
+    [Fact]
+    public void DuplicateSensorIdsAreExcludedWithoutHidingTheOtherGpu()
+    {
+        var ambiguous = Gpu(0, 40, First);
+        var other = Gpu(1, 70, Second);
+        var data = new Telemetry([ambiguous, ambiguous with { Value = 95 }, other]);
+
+        Assert.Null(data.Find(ambiguous.Reference));
+        Assert.Null(data.PrimaryGpu(ambiguous.DeviceId, First)?.Temperature);
+        Assert.Equal(other, Assert.Single(data.HistoryCandidates));
+        Assert.Equal(other, Assert.Single(data.HistorySources));
+        Assert.Equal(70f, Assert.Single(data.CurveSources).Celsius);
+    }
+
+    [Fact]
+    public async Task DefaultHistoryKeepsIdenticalGpusSeparateAcrossRestartAndIndexChanges()
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-device-history-");
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            var first = Gpu(0, 43, First) with { UpdatedAt = now.AddSeconds(-10) };
+            var second = Gpu(1, 70, Second) with { UpdatedAt = now.AddSeconds(-10) };
+            var original = new Telemetry([first, second]);
+            var legacyAt = now.AddSeconds(-20);
+            var legacy = new HistoryPoint(first.Reference, first.Name, first.Unit, legacyAt, legacyAt, 42, 42, 42, 1, 10);
+            File.WriteAllText(Path.Combine(directory.FullName, "history-v1.json"),
+                JsonSerializer.Serialize(new { Version = 1, Points = new[] { legacy } }));
+
+            var store = new HistoryStore(directory.FullName);
+            await store.ReadAsync();
+            store.Configure(HistoryRetention.Hour);
+            store.Offer(original, now.AddSeconds(-10));
+            await store.StopAsync();
+
+            var restarted = new HistoryStore(directory.FullName);
+            await restarted.ReadAsync();
+            restarted.Configure(HistoryRetention.Hour);
+            var reordered = new Telemetry([Gpu(0, 72, Second) with { UpdatedAt = now }, Gpu(1, 44, First) with { UpdatedAt = now }]);
+            restarted.Offer(reordered, now);
+            await restarted.StopAsync();
+
+            var points = await new HistoryStore(directory.FullName).ReadAsync();
+            var series = points.ToLookup(point => point.Sensor);
+            Assert.Equal(3, series.Count);
+            Assert.Equal(legacy, Assert.Single(series[first.Reference]));
+            Assert.Equal(new[] { 43f, 44f }, series[original.PersistentReference(first)].Select(point => point.Mean));
+            Assert.Equal(new[] { 70f, 72f }, series[original.PersistentReference(second)].Select(point => point.Mean));
+        }
+        finally { directory.Delete(recursive: true); }
     }
 
     [Fact]

@@ -24,7 +24,7 @@ $base = "AirDesk-$version/"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [IO.Compression.ZipFile]::OpenRead($portable[0].FullName)
 try {
-    foreach ($item in 'AirDesk.exe','AirDesk.Core.dll','AirDesk.deps.json','BUILD.txt','README.md','LICENSE',
+    foreach ($item in 'AirDesk.exe','AirDesk.Core.dll','AirDesk.Windows.dll','AirDesk.deps.json','BUILD.txt','README.md','LICENSE',
         'THIRD-PARTY-NOTICES.md','licenses/NET-Runtime-THIRD-PARTY-NOTICES.txt') {
         if ($null -eq $archive.GetEntry($base + $item)) { throw "Missing $item" }
     }

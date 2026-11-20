@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/AirDesk.Core/AirDesk.Core.csproj" />
+    <Project Path="src/AirDesk.Windows/AirDesk.Windows.csproj" />
     <Project Path="src/AirDesk/AirDesk.csproj" />
   </Folder>
   <Folder Name="/tests/">

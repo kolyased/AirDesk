@@ -46,14 +46,37 @@ jobs:
   publish:
     needs: [unit, analysis, desktop]
     runs-on: windows-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-      - name: Build portable package
+      - name: Install verified Inno Setup 6.7.4
         shell: pwsh
-        run: ./scripts/Package.ps1
+        run: |
+          $download = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.4.exe'
+          $compiler = Join-Path $env:RUNNER_TEMP 'InnoSetup'
+          $log = Join-Path $env:RUNNER_TEMP 'InnoSetup-install.log'
+          Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe' -OutFile $download
+          if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash -ne 'A549929319F9120716677C685535CA4671E4B937B5FDC87E2585F32D8EB30E8C') {
+            throw 'Inno Setup download SHA-256 mismatch.'
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $download
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne 'E0AB19C8D38CBF9C44709925122A7A02F8C70CB7') {
+            throw 'Inno Setup download signature mismatch.'
+          }
+          $flags = '/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /PORTABLE=1 /DIR="{0}" /LOG="{1}"' -f $compiler, $log
+          $process = Start-Process -FilePath $download -ArgumentList $flags -WindowStyle Hidden -Wait -PassThru
+          $iscc = Join-Path $compiler 'ISCC.exe'
+          if ($process.ExitCode -ne 0 -or !(Test-Path -LiteralPath $iscc -PathType Leaf)) {
+            if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 40 }
+            throw 'Inno Setup compiler installation failed.'
+          }
+          "AIRDESK_ISCC=$iscc" >> $env:GITHUB_ENV
+      - name: Build portable package and installer
+        shell: pwsh
+        run: ./scripts/Package.ps1 -Iscc $env:AIRDESK_ISCC
       - name: Check package contents and SHA-256
         shell: pwsh
         run: ./scripts/Test-Package.ps1
@@ -64,3 +87,81 @@ jobs:
             dist/*-Portable-win-x64.zip
             dist/*-SHA256.txt
           if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AirDesk-setup-win-x64
+          path: |
+            dist/*-Setup-win-x64.exe
+            dist/*-SHA256.txt
+          if-no-files-found: error
+      - name: Check out the 0.7.0 installer source
+        uses: actions/checkout@v4
+        with:
+          ref: 08ab8ba14c3102d22e6a9aa011abf186fa8e721a
+          path: dist/baseline-source
+          persist-credentials: false
+      - name: Build the rollback fixture
+        shell: pwsh
+        run: |
+          ./dist/baseline-source/scripts/Package.ps1 -Iscc $env:AIRDESK_ISCC -OutputDirectory dist/baseline
+          ./dist/baseline-source/scripts/Test-Package.ps1 -Directory dist/baseline -Commit '08ab8ba14c3102d22e6a9aa011abf186fa8e721a'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AirDesk-installer-baseline-0.7.0
+          path: |
+            dist/baseline/AirDesk-0.7.0-Setup-win-x64.exe
+            dist/baseline/AirDesk-0.7.0-SHA256.txt
+          if-no-files-found: error
+  windows-11-installer:
+    needs: publish
+    runs-on: windows-11-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: AirDesk-setup-win-x64
+          path: dist/current
+      - uses: actions/download-artifact@v4
+        with:
+          name: AirDesk-installer-baseline-0.7.0
+          path: dist/baseline
+      - name: Verify Windows 11 and exercise the win-x64 installer
+        shell: pwsh
+        run: |
+          $results = New-Item -ItemType Directory -Path TestResults/windows-11 -Force
+          $os = Get-CimInstance Win32_OperatingSystem
+          $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+          [ordered]@{
+            Caption = $os.Caption
+            Version = $os.Version
+            Build = [int]$os.BuildNumber
+            ProductType = $os.ProductType
+            OSArchitecture = $architecture.ToString()
+            PackageRuntime = 'win-x64 (emulated)'
+          } | ConvertTo-Json | Tee-Object -FilePath (Join-Path $results.FullName 'windows.json')
+          if ($os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 22000 -or $architecture -ne 'Arm64') {
+            throw 'Expected a Windows 11 ARM64 client runner.'
+          }
+
+          $current = @(Get-ChildItem -LiteralPath dist/current -Filter 'AirDesk-*-Setup-win-x64.exe' -File)
+          if ($current.Count -ne 1) { throw 'Expected exactly one current installer.' }
+          $baseline = Get-Item -LiteralPath dist/baseline/AirDesk-0.7.0-Setup-win-x64.exe
+          foreach ($package in $baseline, $current[0]) {
+            $manifest = Join-Path $package.DirectoryName ($package.Name -replace '-Setup-win-x64\.exe$', '-SHA256.txt')
+            $hash = (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ((Get-Content -LiteralPath $manifest) -cnotcontains "$hash  $($package.Name)") {
+              throw "Installer SHA-256 mismatch: $($package.Name)"
+            }
+          }
+          ./scripts/Test-InstallerUpgrade.ps1 -PreviousSetup $baseline.FullName `
+            -CurrentSetup $current[0].FullName -EvidenceDirectory $results.FullName -DesktopSmoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AirDesk-Windows-11-installer-evidence
+          path: |
+            TestResults/windows-11/windows.json
+            TestResults/windows-11/AirDesk-upgrade-*/*.log
+            TestResults/windows-11/AirDesk-upgrade-*/desktop/
+          if-no-files-found: warn

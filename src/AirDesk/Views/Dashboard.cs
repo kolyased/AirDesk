@@ -20,10 +20,11 @@ namespace AirDesk;
 public sealed partial class Dashboard : Window
 {
     const int OverviewTab = 0, CoolingTab = 1, DevicesTab = 2, DiagnosticsTab = 3, SettingsTab = 4, HistoryTab = 5;
-    readonly DashboardViewModel viewModel;
+    readonly MonitoringSession viewModel;
+    readonly DisplayMetric cpuMetric = new(), gpuMetric = new(), memoryMetric = new(), storageMetric = new();
     readonly UserPreferences preferences;
     readonly bool autostartSession;
-    readonly DriverStatus startupDriver = DriverStatus.Read();
+    readonly DriverStatus startupDriver;
     readonly TabControl tabs = new() { BorderThickness = new(0) };
     readonly TextBlock status = Text("Подключение к датчикам…", 13), statusHeading = Text("Мониторинг", 15),
         statusTime = Text("", 12), setupEquipment = Text("Оборудование опрашивается…", 13), activeSummary = Text("Управление BIOS/EC", 14);
@@ -43,13 +44,12 @@ public sealed partial class Dashboard : Window
     bool? warningColor;
     public bool StartMinimized => preferences.StartMinimized;
 
-    public Dashboard(bool autostart, bool benchmark = false, bool recordHistory = false, bool monitorOnly = false)
+    internal Dashboard(MonitoringSession session, DriverStatus startupDriver, bool autostart, bool benchmark, bool recordHistory)
     {
+        viewModel = session;
+        this.startupDriver = startupDriver;
         autostartSession = autostart;
         preferences = UserPreferences.Load(benchmark ? System.IO.Path.Combine(AppContext.BaseDirectory, "ui-test-preferences.json") : null);
-        viewModel = new DashboardViewModel(autostart || monitorOnly,
-            benchmark ? System.IO.Path.Combine(AppContext.BaseDirectory, "benchmark-history") : null);
-        DataContext = viewModel;
         viewModel.ConfigureHistory(benchmark ? recordHistory ? HistoryRetention.Hour : HistoryRetention.Off : preferences.Retention,
             benchmark ? null : preferences.HistorySensors);
         if (!benchmark) viewModel.ConfigureRules(preferences.Rules);
@@ -156,8 +156,8 @@ public sealed partial class Dashboard : Window
         cards[OverviewCard.Gpu] = MonitorCard(OverviewCard.Gpu, gpuValue, gpuSub, "Загрузка");
         cards[OverviewCard.Memory] = MonitorCard(OverviewCard.Memory, ramValue, ramSub, "Занято");
         cards[OverviewCard.Storage] = MonitorCard(OverviewCard.Storage, diskValue, diskSub, "Макс. активность");
-        BindMetric(cpuValue, cpuSub, viewModel.Cpu); BindMetric(gpuValue, gpuSub, viewModel.Gpu);
-        BindMetric(ramValue, ramSub, viewModel.Memory); BindMetric(diskValue, diskSub, viewModel.Storage);
+        BindMetric(cpuValue, cpuSub, cpuMetric); BindMetric(gpuValue, gpuSub, gpuMetric);
+        BindMetric(ramValue, ramSub, memoryMetric); BindMetric(diskValue, diskSub, storageMetric);
         ReorderCards();
         overviewCards.SizeChanged += (_, e) => overviewCards.Columns = DesktopLayout.Columns(e.NewSize.Width);
         body.Children.Add(overviewCards);
@@ -222,14 +222,17 @@ public sealed partial class Dashboard : Window
         if (latest == null)
         {
             RenderFrames();
-            if (viewModel.Stalled)
+            if (viewModel.Failure != null || viewModel.Stalled)
             {
                 statusHeading.Text = "Сбой датчиков";
-                status.Text = "Оборудование не отвечает. Откройте диагностику и проверьте доступ к драйверу.";
+                statusHeading.SetResourceReference(TextBlock.ForegroundProperty, AppTheme.Warning);
+                warningColor = true;
+                status.Text = viewModel.Failure ?? "Оборудование не отвечает. Откройте диагностику и проверьте доступ к драйверу.";
+                if (diagnosticTable.IsVisible) RefreshDiagnostics();
             }
             return;
         }
-        bool stale = viewModel.Stalled || DateTimeOffset.Now - latest.Time >= TimeSpan.FromSeconds(4) ||
+        bool stale = viewModel.Failure != null || viewModel.Stalled || DateTimeOffset.Now - latest.Time >= TimeSpan.FromSeconds(4) ||
             DateTimeOffset.TryParse(latest.Cooling.LastPollUtc, out var polled) && DateTimeOffset.Now - polled >= TimeSpan.FromSeconds(4);
         if (stale && !warnedStalled && (latest.Cooling.CanRelease || latest.Cooling.State is ChannelState.Controlled or ChannelState.Restoring))
         {
@@ -272,6 +275,7 @@ public sealed partial class Dashboard : Window
             ChannelState.Restoring => "Возврат BIOS/EC",
             ChannelState.Error when snapshot.Cooling.NeedsRecovery => "Нужно проверить охлаждение",
             ChannelState.Error => "Ошибка управления",
+            _ when viewModel.Failure != null => "Опрос остановлен",
             _ when stale => "Опрос не отвечает",
             _ when snapshot.PollIssue != null => "Часть датчиков недоступна",
             ChannelState.Controlled => "Управление активно",
@@ -290,6 +294,7 @@ public sealed partial class Dashboard : Window
             warningColor = warning;
         }
         status.Text = state is ChannelState.Conflict or ChannelState.Restoring or ChannelState.Error ? FriendlyStatus(snapshot.Cooling) :
+            viewModel.Failure is { } failure ? failure :
             stale ? "Свежих показаний нет. Проверьте время опроса и состояние драйвера в диагностике." :
             snapshot.PollIssue != null ? "Доступные показатели продолжают обновляться. Откройте диагностику, чтобы найти проблемный датчик." :
             autostartSession && state == ChannelState.MonitorOnly ? "Автозапуск работает в режиме мониторинга. Для настройки охлаждения откройте AirDesk вручную." : FriendlyStatus(snapshot.Cooling);

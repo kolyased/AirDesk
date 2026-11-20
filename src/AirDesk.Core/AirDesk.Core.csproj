@@ -4,6 +4,7 @@
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="AirDesk" />
+    <InternalsVisibleTo Include="AirDesk.Windows" />
     <InternalsVisibleTo Include="AirDesk.Tests" />
   </ItemGroup>
 </Project>
