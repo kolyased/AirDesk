@@ -22,10 +22,10 @@ internal sealed class HistoryStore
     HashSet<SensorReference>? sensors;
     long removedPending;
     int revision;
-    bool stopped, legacyLoaded;
+    bool stopped, legacyLoaded, rollbackRowsPending;
     bool invalidOnLoad;
-    volatile string? error;
-    public string? Error => error;
+    volatile string? error, legacyError;
+    public string? Error => error ?? legacyError;
     public HistoryRetention Retention { get { lock (gate) return retention; } }
     public int Revision { get { lock (gate) return revision; } }
     public (DateTimeOffset From, DateTimeOffset At)? SavedRange { get { lock (gate) return savedRange; } }
@@ -43,7 +43,7 @@ internal sealed class HistoryStore
         try
         {
             HistoryPoint[] rows;
-            if (File.Exists(path)) rows = HistoryJournal.Read(path);
+            if (File.Exists(path)) rows = ReadCurrentAndRollbackHistory();
             else if (File.Exists(legacyPath))
             {
                 rows = HistoryJournal.ReadLegacy(legacyPath);
@@ -59,6 +59,29 @@ internal sealed class HistoryStore
             }
         }
         catch (Exception failure) { invalidOnLoad = true; Fail(failure); }
+    }
+
+    HistoryPoint[] ReadCurrentAndRollbackHistory()
+    {
+        var current = HistoryJournal.Read(path);
+        if (!File.Exists(legacyPath)) return current;
+        try
+        {
+            // An empty v2 journal still supersedes measurements made before it was saved.
+            DateTimeOffset through = current.Where(point => point.Valid).Max(point => (DateTimeOffset?)point.At)
+                ?? File.GetLastWriteTimeUtc(path);
+            var latestAccepted = DateTimeOffset.UtcNow.AddMinutes(1);
+            var rollback = HistoryJournal.ReadLegacy(legacyPath)
+                .Where(point => point?.Valid == true && point.From > through && point.At <= latestAccepted).Distinct().ToArray();
+            rollbackRowsPending = rollback.Length != 0;
+            return rollbackRowsPending ? [.. current, .. rollback] : current;
+        }
+        catch (Exception failure)
+        {
+            legacyError = "Не удалось прочитать history-v1.json: " + failure.Message;
+            DiagnosticLog.Write(failure.ToString());
+            return current;
+        }
     }
 
     public void Configure(HistoryRetention value, IEnumerable<SensorReference>? selection = null)
@@ -144,7 +167,7 @@ internal sealed class HistoryStore
             strategy = retention;
             var cutoff = now - HistoryModel.Period(strategy);
             bool rotate = strategy != HistoryRetention.Off && archive.Any(point => point.From < cutoff);
-            if (pending.Count == 0 && !rotate && !(legacyLoaded && strategy != HistoryRetention.Off)) return;
+            if (pending.Count == 0 && !rotate && !rollbackRowsPending && !(legacyLoaded && strategy != HistoryRetention.Off)) return;
             current = [.. archive, .. pending];
             endOfBatch = removedPending + pending.Count;
         }
@@ -160,6 +183,7 @@ internal sealed class HistoryStore
         {
             archive = compact;
             savedRange = range;
+            rollbackRowsPending = false;
             DiscardPending((int)Math.Clamp(endOfBatch - removedPending, 0, pending.Count));
             revision++;
             error = null;
@@ -181,7 +205,8 @@ internal sealed class HistoryStore
     public async Task ClearAsync()
     {
         await loading.ConfigureAwait(false);
-        if (invalidOnLoad) throw new InvalidDataException("Исходный файл истории сохранён. Скопируйте или переместите его отдельно после выхода из AirDesk.");
+        if (invalidOnLoad || legacyError != null)
+            throw new InvalidDataException("Исходный файл истории сохранён. Скопируйте или переместите его отдельно после выхода из AirDesk.");
         await disk.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -191,7 +216,7 @@ internal sealed class HistoryStore
                 {
                     File.Delete(legacyPath);
                     File.Delete(path);
-                    legacyLoaded = false;
+                    legacyLoaded = rollbackRowsPending = false;
                     archive = []; pending.Clear(); observed.Clear(); savedRange = null;
                     revision++;
                     lastSample = DateTimeOffset.UtcNow;

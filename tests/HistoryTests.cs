@@ -87,6 +87,102 @@ public sealed class HistoryTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task ReupgradeImportsOnlyNewRollbackMeasurementsAndPreservesLegacyHistory()
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            string current = Path.Combine(directory.FullName, "history-v2.json.gz");
+            string legacy = Path.Combine(directory.FullName, "history-v1.json");
+            var now = DateTimeOffset.UtcNow;
+            var saved = TemperaturePoint(now.AddMinutes(-20));
+            var stale = TemperaturePoint(now.AddMinutes(-25));
+            var overlap = TemperaturePoint(now.AddMinutes(-19)) with { From = saved.From, Count = 2 };
+            var rollback = TemperaturePoint(now.AddMinutes(-15));
+            var latest = TemperaturePoint(now.AddMinutes(-10));
+            WriteHistory(current, [saved]);
+            string original = LegacyHistory(stale, saved, overlap, rollback, rollback, latest);
+            File.WriteAllText(legacy, original);
+
+            var history = new HistoryStore(directory.FullName);
+            Assert.Equal(new[] { saved, rollback, latest }, await history.ReadAsync());
+            await history.StopAsync();
+            Assert.Equal(new[] { saved, rollback, latest }, HistoryJournal.Read(current));
+            Assert.Equal(original, File.ReadAllText(legacy));
+
+            var restarted = new HistoryStore(directory.FullName);
+            Assert.Equal(new[] { saved, rollback, latest }, await restarted.ReadAsync());
+            await restarted.StopAsync();
+
+            var nextRollback = TemperaturePoint(now.AddMinutes(-5));
+            File.WriteAllText(legacy, LegacyHistory(stale, saved, overlap, rollback, latest, nextRollback));
+            var reupgraded = new HistoryStore(directory.FullName);
+            Assert.Equal(new[] { saved, rollback, latest, nextRollback }, await reupgraded.ReadAsync());
+            await reupgraded.StopAsync();
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Fact]
+    public async Task ShorteningRetentionDoesNotReloadAnExpiredRollbackJournal()
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            string current = Path.Combine(directory.FullName, "history-v2.json.gz");
+            string legacy = Path.Combine(directory.FullName, "history-v1.json");
+            var now = DateTimeOffset.UtcNow;
+            var saved = TemperaturePoint(now.AddHours(-3));
+            var rollback = TemperaturePoint(now.AddHours(-2));
+            WriteHistory(current, [saved]);
+            string original = LegacyHistory(rollback);
+            File.WriteAllText(legacy, original);
+
+            var history = new HistoryStore(directory.FullName);
+            Assert.Equal(new[] { saved, rollback }, await history.ReadAsync());
+            history.Configure(HistoryRetention.Hour);
+            await history.StopAsync();
+            Assert.Empty(HistoryJournal.Read(current));
+
+            var restarted = new HistoryStore(directory.FullName);
+            Assert.Empty(await restarted.ReadAsync());
+            Assert.Null(restarted.SavedRange);
+            Assert.Equal(original, File.ReadAllText(legacy));
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Fact]
+    public async Task UnreadableRollbackHistoryIsProtectedWhileCurrentHistoryRemainsUsable()
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            string current = Path.Combine(directory.FullName, "history-v2.json.gz");
+            string legacy = Path.Combine(directory.FullName, "history-v1.json");
+            var now = DateTimeOffset.UtcNow;
+            var saved = TemperaturePoint(now.AddMinutes(-15));
+            WriteHistory(current, [saved]);
+            const string unknown = "{\"Version\":93,\"Points\":[]}";
+            File.WriteAllText(legacy, unknown);
+
+            var history = new HistoryStore(directory.FullName);
+            Assert.Equal(saved, Assert.Single(await history.ReadAsync()));
+            history.Configure(HistoryRetention.Hour);
+            history.Offer(new Telemetry([DiskTemperature(0, now)]), now);
+            await history.StopAsync();
+
+            Assert.Equal(new[] { saved, TemperaturePoint(now) }, HistoryJournal.Read(current));
+            Assert.NotNull(history.Error);
+            await Assert.ThrowsAsync<InvalidDataException>(history.ClearAsync);
+            Assert.Equal(unknown, File.ReadAllText(legacy));
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    static string LegacyHistory(params HistoryPoint[] points) => JsonSerializer.Serialize(new { Version = 1, Points = points });
+
+    [Fact]
     public void AggregationKeepsTimestampsExtremaAndRetention()
     {
         var now = DateTimeOffset.Parse("2026-11-18T15:40:00Z");
