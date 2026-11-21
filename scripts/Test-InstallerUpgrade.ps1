@@ -16,7 +16,7 @@ $executable = Join-Path $destination 'AirDesk.exe'
 $uninstall = Join-Path $destination 'unins000.exe'
 $uninstallKey = 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Uninstall/{A05B3464-9731-44CA-94A7-902E82617A47}_is1'
 $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'AirDesk/AirDesk.lnk'
-$runKey = 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Run'
+$runKey = 'Software\Microsoft\Windows\CurrentVersion\Run'
 $data = Join-Path $env:LOCALAPPDATA 'AirDesk'
 $preferences = Join-Path $data 'monitor-preferences-v1.json'
 $history = Join-Path $data 'history-v1.json'
@@ -53,8 +53,15 @@ function Test-InstalledVersion($Package) {
     }
 }
 
+function Get-StartupCommand {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($runKey)
+    if ($null -eq $key) { return }
+    try { return ,($key.GetValue('AirDesk', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)) }
+    finally { $key.Dispose() }
+}
+
 function Test-Startup($Expected = $null) {
-    $actual = Get-ItemPropertyValue -LiteralPath $runKey -Name AirDesk -ErrorAction SilentlyContinue
+    $actual = Get-StartupCommand
     if ($null -eq $actual -and $null -eq $Expected) { return }
     if ($actual -isnot [string] -or $actual -ne $Expected) { throw 'Unexpected current-user AirDesk startup command.' }
 }
@@ -77,8 +84,7 @@ if ($previous.VersionInfo.FileVersionRaw -ge $current.VersionInfo.FileVersionRaw
 }
 if (Test-Path $uninstallKey) { throw 'Use a disposable user without an installed copy of AirDesk.' }
 if (Test-Path $shortcut) { throw 'The Start-menu shortcut already exists.' }
-$existingRun = Get-ItemProperty -LiteralPath $runKey -ErrorAction SilentlyContinue
-if ($existingRun -and $existingRun.PSObject.Properties['AirDesk']) {
+if ($null -ne (Get-StartupCommand)) {
     throw 'The current user already has AirDesk in auto-start.'
 }
 foreach ($existing in $preferences, "$preferences.bak", $history, "$history.bak") {
