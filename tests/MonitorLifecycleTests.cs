@@ -25,6 +25,58 @@ public sealed class MonitorLifecycleTests
         Assert.Equal(0, hardware.Opens);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SessionShutdownReportsWhetherHistoryWasSaved(bool blockWrite)
+    {
+        var folder = Directory.CreateTempSubdirectory("AirDesk-shutdown-");
+        try
+        {
+            string path = Path.Combine(folder.FullName, "history-v2.json.gz");
+            if (blockWrite) Directory.CreateDirectory(path);
+            var session = new MonitoringSession(Create(new Hardware()), folder.FullName);
+            var poll = Readings();
+            session.ConfigureHistory(HistoryRetention.Hour, [poll.Telemetry.Readings[0].Reference]);
+            await session.History.ReadAsync();
+            session.History.Offer(poll.Telemetry, DateTimeOffset.UtcNow);
+            Assert.Single(await session.History.ReadAsync());
+
+            var result = await session.ShutdownAsync();
+
+            Assert.Null(result.CoolingError);
+            Assert.Equal(!blockWrite, result.History.Succeeded);
+            Assert.Equal(blockWrite, result.History.Error != null);
+            Assert.Equal(!blockWrite, File.Exists(path));
+            Assert.Same(result, await session.ShutdownAsync());
+        }
+        finally { folder.Delete(recursive: true); }
+    }
+
+    [Fact]
+    public async Task CalibrationCommandReturnsTheFailureToTheSession()
+    {
+        var hardware = new Hardware { Writing = () => throw new InvalidOperationException("calibration backend refused") };
+        var executor = Create(hardware, monitorOnly: false);
+        var folder = Directory.CreateTempSubdirectory("AirDesk-calibration-");
+        var session = new MonitoringSession(executor, folder.FullName);
+        session.Start();
+        try
+        {
+            await WaitFor(() => session.Latest?.Cooling.CanCalibrate == true);
+            string error = await session.Calibrate(new(Channel, "Hub", "PWM", SignalMode.Pwm, 65));
+
+            Assert.Equal("calibration backend refused", error);
+            await WaitFor(() => Volatile.Read(ref hardware.Restores) == 1);
+            Assert.Empty(hardware.Writes);
+        }
+        finally
+        {
+            await session.ShutdownAsync();
+            folder.Delete(recursive: true);
+        }
+    }
+
     [Fact]
     public async Task StartupFailureIsVisibleAndDisposesTheAdapterEvenIfLoggingFails()
     {
@@ -195,6 +247,7 @@ public sealed class MonitorLifecycleTests
     {
         public Action? Opening { get; init; }
         public Action? Sampling { get; init; }
+        public Action? Writing { get; init; }
         public volatile Func<int, SensorPoll>? Polling;
         int polls;
         volatile float duty = 55;
@@ -214,7 +267,14 @@ public sealed class MonitorLifecycleTests
         }
         public void Acquire() { }
         public void AcquireRecoveryLease() { }
-        public float? Write(float percent, Action<float?> guard) { guard(duty); duty = percent; Writes.Enqueue(percent); return percent; }
+        public float? Write(float percent, Action<float?> guard)
+        {
+            guard(duty);
+            Writing?.Invoke();
+            duty = percent;
+            Writes.Enqueue(percent);
+            return percent;
+        }
         public RestoreResult Restore() { duty = 55; Interlocked.Increment(ref Restores); return new(true, true, "confirmed"); }
         public void ReleaseLease() { }
         public void Dispose() => Interlocked.Increment(ref Disposals);

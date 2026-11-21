@@ -184,7 +184,7 @@ public sealed partial class Dashboard
         actionDetails.Visibility = (requestDetail.Text.Length > 0 || restoreDetail.Text.Length > 0) ? Visibility.Visible : Visibility.Collapsed;
     }
 
-    async Task<bool> Execute(Func<Task<string>> command, string failure)
+    async Task<bool> Execute(Func<Task<string>> command, string failure, bool showErrorInline = false)
     {
         if (commandPending || quitting) return false;
         commandPending = true;
@@ -193,6 +193,7 @@ public sealed partial class Dashboard
         {
             string result = await command().WaitAsync(TimeSpan.FromSeconds(5));
             if (result.Length == 0) ShowCoolingAction("");
+            else if (showErrorInline) ShowCoolingAction($"{failure} {result}", error: true);
             else ShowCoolingAction(failure, error: true, result);
             return result.Length == 0;
         }
@@ -428,9 +429,11 @@ public sealed partial class Dashboard
             result = new(identity, group.Text.Trim(), topology.Text.Trim(), (SignalMode)signal.SelectedIndex, min);
             window.DialogResult = true;
         }));
-        if (window.ShowDialog() == true && result is { } proposal) _ = Execute(() => viewModel.Calibrate(proposal),
-            "Калибровка не началась. Проверьте, что датчики отвечают, а охлаждение сейчас регулирует BIOS/EC.");
+        if (window.ShowDialog() == true && result is { } proposal) _ = ExecuteCalibration(() => viewModel.Calibrate(proposal));
     }
+
+    Task<bool> ExecuteCalibration(Func<Task<string>> command) =>
+        Execute(command, "Не удалось начать калибровку.", showErrorInline: true);
 
     void EditCurve()
     {

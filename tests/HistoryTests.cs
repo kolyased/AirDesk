@@ -70,20 +70,208 @@ public sealed class HistoryTests(ITestOutputHelper output)
             var now = DateTimeOffset.UtcNow;
             var disk = DiskTemperature(0, now);
             var legacyPoint = new HistoryPoint(disk.Reference, disk.Name, disk.Unit, now, now, 40, 40, 40, 1, 10);
-            string original = JsonSerializer.Serialize(new { Version = 1, Points = new[] { legacyPoint } });
+            string original = LegacyHistory(legacyPoint with { From = now.AddSeconds(1), At = now.AddSeconds(1) });
             File.WriteAllText(legacy, original);
             File.WriteAllText(compressed, "incomplete");
+            byte[] originalLegacy = File.ReadAllBytes(legacy);
+            byte[] originalCurrent = File.ReadAllBytes(compressed);
             var history = new HistoryStore(directory);
             Assert.Empty(await history.ReadAsync());
             Assert.NotNull(history.Error);
             history.Configure(HistoryRetention.Hour);
             history.Offer(new Telemetry([disk]), now);
-            await history.StopAsync();
-            await Assert.ThrowsAsync<InvalidDataException>(history.ClearAsync);
-            Assert.Equal("incomplete", File.ReadAllText(compressed));
-            Assert.Equal(original, File.ReadAllText(legacy));
+            Assert.True((await history.StopAsync()).Succeeded);
+            string[] preserved = Directory.GetFiles(directory).Except([compressed]).ToArray();
+            Assert.Equal(2, preserved.Length);
+            Assert.Contains(preserved, file => File.ReadAllBytes(file).SequenceEqual(originalCurrent));
+            Assert.Contains(preserved, file => File.ReadAllBytes(file).SequenceEqual(originalLegacy));
+            var restarted = new HistoryStore(directory);
+            Assert.Equal(TemperaturePoint(now), Assert.Single(await restarted.ReadAsync()));
+            await restarted.ClearAsync();
+            Assert.Empty(await new HistoryStore(directory).ReadAsync());
+            Assert.All(preserved, file => Assert.True(File.Exists(file)));
         }
         finally { Directory.Delete(directory, recursive: true); }
+    }
+
+    [Fact]
+    public async Task FutureCompressedHistoryWithAnIncompatiblePayloadIsLeftInPlace()
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "history-v2.json.gz");
+            using (var file = File.Create(path))
+            using (var gzip = new GZipStream(file, CompressionLevel.Fastest))
+                gzip.Write("{\"Series\":{},\"Version\":93}"u8);
+            byte[] original = File.ReadAllBytes(path);
+            var history = new HistoryStore(directory.FullName);
+            Assert.Empty(await history.ReadAsync());
+            Assert.Contains("93", history.Error);
+            var now = DateTimeOffset.UtcNow;
+            history.Configure(HistoryRetention.Hour);
+            history.Offer(new Telemetry([DiskTemperature(0, now)]), now);
+
+            var result = await history.StopAsync();
+            Assert.False(result.Succeeded);
+            Assert.Contains("93", result.Error);
+
+            await Assert.ThrowsAsync<InvalidDataException>(history.ClearAsync);
+            Assert.Equal(path, Assert.Single(Directory.GetFiles(directory.FullName)));
+            Assert.Equal(original, File.ReadAllBytes(path));
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Theory]
+    [InlineData("history-v2.json.gz")]
+    [InlineData("history-v1.json")]
+    public async Task CorruptHistoryIsPreservedBeforeNewSamplesAreSaved(string archiveName)
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            byte[] original = [0x00, 0xC0, 0xFF, 0x0A];
+            File.WriteAllBytes(Path.Combine(directory.FullName, archiveName), original);
+            var history = new HistoryStore(directory.FullName);
+            Assert.Empty(await history.ReadAsync());
+
+            var now = DateTimeOffset.UtcNow;
+            history.Configure(HistoryRetention.Hour);
+            history.Offer(new Telemetry([DiskTemperature(0, now)]), now);
+            Assert.True((await history.FlushAsync()).Succeeded);
+
+            string active = Path.Combine(directory.FullName, "history-v2.json.gz");
+            string preserved = Assert.Single(Directory.GetFiles(directory.FullName).Except([active]));
+            Assert.NotEqual(Path.Combine(directory.FullName, archiveName), preserved);
+            Assert.Equal(original, File.ReadAllBytes(preserved));
+            Assert.True(history.OwnsPath(preserved));
+            Assert.Contains(Path.GetFileName(preserved), history.Error);
+
+            var restarted = new HistoryStore(directory.FullName);
+            Assert.Equal(TemperaturePoint(now), Assert.Single(await restarted.ReadAsync()));
+            await restarted.ClearAsync();
+            Assert.Equal(preserved, Assert.Single(Directory.GetFiles(directory.FullName)));
+            Assert.Equal(original, File.ReadAllBytes(preserved));
+            Assert.Empty(await new HistoryStore(directory.FullName).ReadAsync());
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(8)]
+    public async Task HistoryWithATruncatedGzipTrailerIsPreservedBeforeNewSamplesAreSaved(int missingBytes)
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "history-v2.json.gz");
+            var now = DateTimeOffset.UtcNow;
+            WriteHistory(path, [TemperaturePoint(now.AddMinutes(-5))]);
+            byte[] truncated = File.ReadAllBytes(path)[..^missingBytes];
+            File.WriteAllBytes(path, truncated);
+
+            var history = new HistoryStore(directory.FullName);
+            Assert.Empty(await history.ReadAsync());
+            Assert.NotNull(history.Error);
+            history.Configure(HistoryRetention.Hour);
+            history.Offer(new Telemetry([DiskTemperature(0, now)]), now);
+            Assert.True((await history.StopAsync()).Succeeded);
+
+            string preserved = Assert.Single(Directory.GetFiles(directory.FullName).Except([path]));
+            Assert.Equal(truncated, File.ReadAllBytes(preserved));
+            Assert.Equal(TemperaturePoint(now), Assert.Single(await new HistoryStore(directory.FullName).ReadAsync()));
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Fact]
+    public async Task RecoveryNoticeNamesTheBackupWhenAFutureRollbackArchiveRemainsInPlace()
+    {
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "history-v2.json.gz");
+            string legacy = Path.Combine(directory.FullName, "history-v1.json");
+            const string future = "{\"Version\":93,\"Points\":[]}";
+            File.WriteAllText(legacy, future);
+            File.WriteAllText(path, "incomplete");
+            var history = new HistoryStore(directory.FullName);
+            Assert.Empty(await history.ReadAsync());
+            var now = DateTimeOffset.UtcNow;
+            history.Configure(HistoryRetention.Hour);
+            history.Offer(new Telemetry([DiskTemperature(0, now)]), now);
+
+            Assert.True((await history.StopAsync()).Succeeded);
+            string preserved = Assert.Single(Directory.GetFiles(directory.FullName).Except([path, legacy]));
+            Assert.Contains(Path.GetFileName(preserved), history.Error);
+            Assert.Contains("93", history.Error);
+            Assert.Equal(future, File.ReadAllText(legacy));
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Fact]
+    public async Task LockedHistoryRemainsProtectedUntilItCanBePreserved()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "history-v2.json.gz");
+            byte[] original = [0x01, 0xFE, 0x00];
+            File.WriteAllBytes(path, original);
+            HistoryStore history;
+            var now = DateTimeOffset.UtcNow;
+            using (var locked = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                history = new HistoryStore(directory.FullName);
+                Assert.Empty(await history.ReadAsync());
+                history.Configure(HistoryRetention.Hour);
+                history.Offer(new Telemetry([DiskTemperature(0, now)]), now);
+                Assert.False((await history.FlushAsync()).Succeeded);
+                await Assert.ThrowsAsync<InvalidDataException>(history.ClearAsync);
+                Assert.Equal(path, Assert.Single(Directory.GetFiles(directory.FullName)));
+                byte[] onDisk = new byte[original.Length];
+                locked.ReadExactly(onDisk);
+                Assert.Equal(original, onDisk);
+            }
+
+            Assert.True((await history.StopAsync()).Succeeded);
+            Assert.Equal(TemperaturePoint(now), Assert.Single(await new HistoryStore(directory.FullName).ReadAsync()));
+            Assert.Equal(original, File.ReadAllBytes(Assert.Single(Directory.GetFiles(directory.FullName).Except([path]))));
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Fact]
+    public async Task TemporarilyLockedValidHistoryIsReloadedAfterTheLockIsReleased()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var directory = Directory.CreateTempSubdirectory("AirDesk-history-");
+        try
+        {
+            string path = Path.Combine(directory.FullName, "history-v2.json.gz");
+            var now = DateTimeOffset.UtcNow;
+            var saved = TemperaturePoint(now);
+            WriteHistory(path, [saved]);
+            HistoryStore history;
+            using (File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                history = new HistoryStore(directory.FullName);
+                await history.ReadAsync();
+                history.Configure(HistoryRetention.Hour);
+                history.Offer(new Telemetry([DiskTemperature(0, now)]), now);
+                Assert.False((await history.FlushAsync()).Succeeded);
+            }
+
+            Assert.True((await history.StopAsync()).Succeeded);
+            Assert.Null(history.Error);
+            Assert.Equal(saved, Assert.Single(history.Read()));
+            Assert.Equal(path, Assert.Single(Directory.GetFiles(directory.FullName)));
+        }
+        finally { directory.Delete(recursive: true); }
     }
 
     [Fact]

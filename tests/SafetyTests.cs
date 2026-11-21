@@ -33,10 +33,27 @@ public sealed class SafetyTests
         var rig = new Rig();
         rig.Seed();
         rig.Output.BeforeGuard = () => rig.PassTime(8);
-        rig.Safety.BeginCalibration(Profile);
+        Reject(() => rig.Safety.BeginCalibration(Profile));
         rig.Safety.Tick();
         Assert.Empty(rig.Output.Writes);
         Assert.Equal(1, rig.Output.Restores);
+        Assert.False(rig.Store.RecoveryPending);
+    }
+
+    [Fact]
+    public void CalibrationReturnsTheBackendErrorAndSchedulesRestore()
+    {
+        var rig = new Rig();
+        rig.Seed();
+        var failure = new InvalidOperationException("backend rejected calibration");
+        rig.Output.BeforeGuard = () => throw failure;
+
+        Assert.Same(failure, Assert.Throws<InvalidOperationException>(() => rig.Safety.BeginCalibration(Profile)));
+        Assert.True(rig.Store.RecoveryPending);
+        Assert.Equal(ChannelState.Restoring, rig.Safety.View().State);
+        rig.Safety.Tick();
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.Empty(rig.Output.Writes);
         Assert.False(rig.Store.RecoveryPending);
     }
 
@@ -50,7 +67,7 @@ public sealed class SafetyTests
         Assert.True(rig.Safety.View().CanCalibrate);
         rig.Output.BeforeGuard = () => rig.Output.LiveDuty = liveDuty;
 
-        rig.Safety.BeginCalibration(Profile);
+        Reject(() => rig.Safety.BeginCalibration(Profile));
         rig.Safety.Tick();
 
         Assert.Empty(rig.Output.Writes);
@@ -137,7 +154,7 @@ public sealed class SafetyTests
         var rig = new Rig();
         rig.Seed();
         rig.Output.ReadbackOverride = 100;
-        rig.Safety.BeginCalibration(Profile with { Floor = 99.8f });
+        Reject(() => rig.Safety.BeginCalibration(Profile with { Floor = 99.8f }));
 
         Assert.Equal(ChannelState.Restoring, rig.Safety.View().State);
         rig.Safety.Tick();
@@ -346,16 +363,66 @@ public sealed class SafetyTests
     }
 
     [Fact]
-    public void ConflictAtWriteGuardBlocksWrite()
+    public void EveryWriteRefreshesTheConflictScanOutsideTheBusLock()
+    {
+        var rig = Rig.Active();
+        int scansBeforeAdjustment = rig.ConflictScans;
+        rig.Safety.Adjust(Manual with { Manual = 90 });
+
+        Assert.Equal(2, rig.Output.Writes.Count);
+        Assert.True(rig.ConflictScans >= scansBeforeAdjustment + 2);
+        Assert.Equal(0, rig.ConflictScansUnderBus);
+    }
+
+    [Fact]
+    public void AnExpiredConflictScanBlocksAWriteEvenWithFreshSensors()
+    {
+        var rig = Rig.Active();
+        rig.Output.BeforeGuard = () => rig.PassTime(.5);
+
+        var error = Assert.Throws<InvalidOperationException>(() => rig.Safety.Adjust(Manual with { Manual = 90 }));
+
+        Assert.Contains("проверка конфликтов", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(rig.Output.Writes);
+        rig.Safety.Tick();
+        Assert.Equal(1, rig.Output.Restores);
+    }
+
+    [Fact]
+    public void FailedPerWriteScanDoesNotEnterTheBus()
+    {
+        var rig = Rig.Active();
+        rig.OnLog = message =>
+        {
+            if (message.StartsWith("Команда принята", StringComparison.Ordinal))
+                rig.ScanFailure = new InvalidOperationException("process enumeration failed");
+        };
+
+        var error = Assert.Throws<InvalidOperationException>(() => rig.Safety.Adjust(Manual with { Manual = 90 }));
+
+        Assert.Equal("process enumeration failed", error.Message);
+        Assert.Equal(1, rig.Output.WriteAttempts);
+        Assert.Single(rig.Output.Writes);
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.False(rig.Store.RecoveryPending);
+    }
+
+    [Fact]
+    public void ConflictDetectedAfterTheScheduledScanBlocksWrite()
     {
         var rig = new Rig(Profile);
         Reject(() => rig.Safety.Enable(Manual));
         rig.Safety.ConfirmUnchangedTopology();
         rig.Safety.Tick();
-        rig.Output.BeforeGuard = () => rig.Conflict = "FanControl.Service";
+        rig.OnLog = message =>
+        {
+            if (message.StartsWith("Команда принята", StringComparison.Ordinal)) rig.Conflict = "FanControl.Service";
+        };
         Reject(() => rig.Safety.Enable(Manual));
         rig.Safety.Tick();
-        Check(rig.Output.Writes.Count == 0 && rig.Output.Restores == 1, "Process appearing immediately before write blocks it");
+        Assert.Empty(rig.Output.Writes);
+        Assert.Equal(0, rig.ConflictScansUnderBus);
+        Assert.Equal(1, rig.Output.Restores);
     }
 
     [Fact]
@@ -548,19 +615,24 @@ public sealed class SafetyTests
     {
         TimeSpan time;
         public string? Conflict;
+        public Action<string>? OnLog;
+        public Exception? ScanFailure;
         public int ConflictScans;
+        public int ConflictScansUnderBus;
         public Output Output { get; } = new();
         public Store Store { get; }
         public CoolingSafety Safety { get; }
         public Rig(Calibration? saved = null, bool recovery = false)
         {
             Store = new() { Saved = saved, RecoveryPending = recovery };
-            Safety = new(Output, Store, Scan, () => time, _ => { }, () => false);
+            Safety = new(Output, Store, Scan, () => time, message => OnLog?.Invoke(message), () => false);
             if (saved != null) Seed();
         }
         string? Scan()
         {
             ConflictScans++;
+            if (Output.HoldingBus) ConflictScansUnderBus++;
+            if (ScanFailure != null) throw ScanFailure;
             return Conflict;
         }
         public static Rig Active()
@@ -587,6 +659,8 @@ public sealed class SafetyTests
         public int Restores, RestoreFailures;
         public bool ReadbackMatches = true;
         public bool RecoveryLeaseBusy;
+        public int WriteAttempts { get; private set; }
+        public bool HoldingBus { get; private set; }
         public float? ReadbackOverride;
         public float? LiveDuty = 60;
         public Action? BeforeGuard;
@@ -596,7 +670,19 @@ public sealed class SafetyTests
             if (RecoveryLeaseBusy) throw new InvalidOperationException("Another session owns cooling.");
         }
         public void ReleaseLease() { }
-        public float? Write(float percent, Action<float?> guard) { BeforeGuard?.Invoke(); guard(LiveDuty); Writes.Add(percent); return ReadbackMatches ? ReadbackOverride ?? percent : null; }
+        public float? Write(float percent, Action<float?> guard)
+        {
+            WriteAttempts++;
+            HoldingBus = true;
+            try
+            {
+                BeforeGuard?.Invoke();
+                guard(LiveDuty);
+                Writes.Add(percent);
+                return ReadbackMatches ? ReadbackOverride ?? percent : null;
+            }
+            finally { HoldingBus = false; }
+        }
         public RestoreResult Restore() => ++Restores <= RestoreFailures ? new(false, false, "fault") : new(true, true, "confirmed");
     }
 

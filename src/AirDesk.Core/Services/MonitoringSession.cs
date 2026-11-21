@@ -5,9 +5,12 @@ using System.Threading.Tasks;
 
 namespace AirDesk;
 
+internal sealed record MonitoringShutdownResult(CoolingView? Cooling, string? CoolingError, HistorySaveResult History);
+
 internal sealed class MonitoringSession
 {
     readonly Monitor executor;
+    readonly Lazy<Task<MonitoringShutdownResult>> shutdown;
     readonly ThresholdEvaluator thresholds = new();
     readonly ConcurrentQueue<string> alerts = new();
     volatile ThresholdRule[] rules = [];
@@ -20,6 +23,7 @@ internal sealed class MonitoringSession
     {
         this.executor = executor;
         History = new HistoryStore(historyFolder);
+        shutdown = new(ShutdownOnceAsync);
         executor.Sampled = (telemetry, now) =>
         {
             History.Offer(telemetry, now);
@@ -51,14 +55,26 @@ internal sealed class MonitoringSession
     public Task<string> Enable(FanProfile profile) => executor.Submit(safety => safety.Enable(profile));
     public Task<string> Adjust(FanProfile profile) => executor.Submit(safety => safety.Adjust(profile));
 
-    public async Task<CoolingView?> ShutdownAsync()
-    {
-        try { return await executor.ShutdownAsync().ConfigureAwait(false); }
-        finally
-        {
-            try { await History.StopAsync().WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false); }
-            catch (Exception error) { Monitor.Log(error); }
-        }
-    }
+    public Task<MonitoringShutdownResult> ShutdownAsync() => shutdown.Value;
 
+    async Task<MonitoringShutdownResult> ShutdownOnceAsync()
+    {
+        CoolingView? cooling = null;
+        string? coolingError = null;
+        try { cooling = await executor.ShutdownAsync().ConfigureAwait(false); }
+        catch (Exception error)
+        {
+            Monitor.Log(error);
+            coolingError = error is TimeoutException ? "Драйвер не ответил вовремя." : error.Message;
+        }
+
+        HistorySaveResult history;
+        try { history = await History.StopAsync().WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false); }
+        catch (Exception error)
+        {
+            Monitor.Log(error);
+            history = new(error is TimeoutException ? "Запись истории не завершилась вовремя." : error.Message);
+        }
+        return new(cooling, coolingError, history);
+    }
 }

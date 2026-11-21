@@ -324,7 +324,11 @@ public sealed partial class Dashboard : Window
 
     internal void EndSession()
     {
-        try { viewModel.ShutdownAsync().GetAwaiter().GetResult(); }
+        try
+        {
+            var warning = ExitWarning(viewModel.ShutdownAsync().GetAwaiter().GetResult());
+            if (warning != null) DiagnosticLog.Write(warning);
+        }
         catch (Exception error) { Monitor.Log(error); }
         finally { DisposeShell(); }
     }
@@ -339,20 +343,32 @@ public sealed partial class Dashboard : Window
     {
         if (quitting) return;
         quitting = true;
-        string? warning = reason;
+        string? warning;
         try
         {
-            CoolingView? result = await viewModel.ShutdownAsync();
-            if (result is { NeedsRecovery: true })
-                warning = "Возврат BIOS/EC не подтверждён. Проверьте охлаждение. Подробности в %LOCALAPPDATA%\\AirDesk\\cooling.log.";
+            warning = ExitWarning(await viewModel.ShutdownAsync(), reason);
         }
         catch (Exception error)
         {
             Monitor.Log(error);
-            warning = "Драйвер не ответил вовремя. Возврат BIOS/EC не подтверждён. Проверьте охлаждение.";
+            warning = "Не удалось завершить AirDesk штатно. Проверьте охлаждение и журнал AirDesk.";
         }
         if (warning != null) MessageBox.Show(warning, "AirDesk", MessageBoxButton.OK, MessageBoxImage.Warning);
         DisposeShell(); Application.Current.Shutdown();
+    }
+
+    static string? ExitWarning(MonitoringShutdownResult result, string? reason = null)
+    {
+        var warnings = new List<string>();
+        if (reason != null) warnings.Add(reason);
+        if (result.CoolingError != null || result.Cooling is { NeedsRecovery: true })
+        {
+            const string cooling = "Возврат BIOS/EC не подтверждён. Проверьте охлаждение. Подробности в %LOCALAPPDATA%\\AirDesk\\cooling.log.";
+            warnings.Add(result.CoolingError == null ? cooling : $"{result.CoolingError} {cooling}");
+        }
+        if (!result.History.Succeeded)
+            warnings.Add($"История при выходе не сохранена. Последние замеры могут отсутствовать. {result.History.Error}");
+        return warnings.Count == 0 ? null : string.Join("\n\n", warnings);
     }
 
     internal void DisposeShell()

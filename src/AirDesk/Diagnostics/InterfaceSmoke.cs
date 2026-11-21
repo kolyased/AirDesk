@@ -46,6 +46,7 @@ public sealed partial class Dashboard
         VerifyLiveGraphs();
         Navigate(CoolingTab);
         SaveImage(this, "cooling", 96);
+        await VerifyFailureMessagesAsync();
         var editor = BuildCurveEditor(false, out var readPoints);
         editor.Show();
         try
@@ -100,6 +101,22 @@ public sealed partial class Dashboard
         }
         finally { DisposeFrames(); File.Delete(frameFixture); }
         File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "ui-smoke.json"), JsonSerializer.Serialize(results));
+    }
+
+    async Task VerifyFailureMessagesAsync()
+    {
+        const string refusal = "Начальный уровень калибровки не подтверждён.";
+        if (await ExecuteCalibration(() => Task.FromResult(refusal)) ||
+            requestError.Visibility != Visibility.Visible || !requestError.Text.Contains(refusal, StringComparison.Ordinal) ||
+            requestStatus.Visibility != Visibility.Collapsed)
+            throw new InvalidOperationException("The calibration refusal was not shown as a visible error.");
+        ShowCoolingAction("");
+
+        const string saveError = "Нет доступа к файлу истории.";
+        var warning = ExitWarning(new(null, "Драйвер не ответил вовремя.", new(saveError)));
+        if (warning == null || !warning.Contains(saveError, StringComparison.Ordinal) ||
+            !warning.Contains("Возврат BIOS/EC", StringComparison.Ordinal) || ExitWarning(new(null, null, new())) != null)
+            throw new InvalidOperationException("The exit warning did not report both outcomes separately.");
     }
 
     void VerifyLiveGraphs()

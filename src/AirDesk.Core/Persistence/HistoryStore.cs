@@ -2,13 +2,27 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace AirDesk;
 
+internal sealed record HistorySaveResult(string? Error = null)
+{
+    public bool Succeeded => Error is null;
+}
+
 internal sealed class HistoryStore
 {
+    const string RecoverySuffix = ".recovered-";
+    sealed record UnreadableArchive(string Path, Exception Failure)
+    {
+        public string Message => $"Не удалось прочитать {System.IO.Path.GetFileName(Path)}. {Failure.Message}";
+        public InvalidDataException WriteBlocked() =>
+            new($"{Message} Исходный файл сохранён. Новые показания не записаны.", Failure);
+    }
+
     readonly string path, legacyPath;
     HistoryPoint[] archive = [];
     readonly List<HistoryPoint> pending = new();
@@ -22,10 +36,18 @@ internal sealed class HistoryStore
     HashSet<SensorReference>? sensors;
     long removedPending;
     int revision;
-    bool stopped, legacyLoaded, rollbackRowsPending;
-    bool invalidOnLoad;
-    volatile string? error, legacyError;
-    public string? Error => error ?? legacyError;
+    bool stopped, legacyLoaded, rollbackRowsPending, createRecoveredArchive;
+    volatile UnreadableArchive? unreadableArchive;
+    volatile string? saveError, legacyError, recoveryNotice;
+    public string? Error
+    {
+        get
+        {
+            string? error = saveError ?? unreadableArchive?.Message ?? legacyError;
+            string? notice = recoveryNotice;
+            return error == null ? notice : notice == null ? error : $"{error}\n{notice}";
+        }
+    }
     public HistoryRetention Retention { get { lock (gate) return retention; } }
     public int Revision { get { lock (gate) return revision; } }
     public (DateTimeOffset From, DateTimeOffset At)? SavedRange { get { lock (gate) return savedRange; } }
@@ -40,42 +62,61 @@ internal sealed class HistoryStore
 
     void Load()
     {
+        if (!LoadArchive(path)) LoadArchive(legacyPath);
+    }
+
+    bool LoadArchive(string source)
+    {
         try
         {
-            HistoryPoint[] rows;
-            if (File.Exists(path)) rows = ReadCurrentAndRollbackHistory();
-            else if (File.Exists(legacyPath))
-            {
-                rows = HistoryJournal.ReadLegacy(legacyPath);
-                legacyLoaded = true;
-            }
-            else return;
+            var rows = source == path ? ReadCurrentAndRollbackHistory() : HistoryJournal.ReadLegacy(source);
             lock (gate)
             {
+                legacyLoaded = source == legacyPath;
+                unreadableArchive = null;
+                saveError = null;
                 archive = rows.Where(point => point?.Valid == true).OrderBy(point => point.At).TakeLast(HistoryModel.MaxPoints).ToArray();
                 savedRange = HistoryModel.RecordedRange(archive);
-                foreach (var point in archive) observed[point.Sensor] = point.At;
+                var saved = new Dictionary<SensorReference, DateTimeOffset>();
+                foreach (var point in archive) saved[point.Sensor] = point.At;
+                // A file that was temporarily locked can become readable after sampling has started.
+                removedPending += pending.RemoveAll(point => saved.TryGetValue(point.Sensor, out var time) && point.At <= time);
+                foreach (var (sensor, time) in saved)
+                    if (!observed.TryGetValue(sensor, out var latest) || time > latest) observed[sensor] = time;
                 revision++;
             }
         }
-        catch (Exception failure) { invalidOnLoad = true; Fail(failure); }
+        catch (FileNotFoundException) { return false; }
+        catch (DirectoryNotFoundException) { return false; }
+        catch (Exception failure)
+        {
+            lock (gate)
+            {
+                unreadableArchive = new(source, failure);
+                revision++;
+            }
+            DiagnosticLog.Write(failure.ToString());
+        }
+        return true;
     }
 
     HistoryPoint[] ReadCurrentAndRollbackHistory()
     {
         var current = HistoryJournal.Read(path);
-        if (!File.Exists(legacyPath)) return current;
         try
         {
+            var legacy = HistoryJournal.ReadLegacy(legacyPath);
             // An empty v2 journal still supersedes measurements made before it was saved.
             DateTimeOffset through = current.Where(point => point.Valid).Max(point => (DateTimeOffset?)point.At)
                 ?? File.GetLastWriteTimeUtc(path);
             var latestAccepted = DateTimeOffset.UtcNow.AddMinutes(1);
-            var rollback = HistoryJournal.ReadLegacy(legacyPath)
+            var rollback = legacy
                 .Where(point => point?.Valid == true && point.From > through && point.At <= latestAccepted).Distinct().ToArray();
             rollbackRowsPending = rollback.Length != 0;
             return rollbackRowsPending ? [.. current, .. rollback] : current;
         }
+        catch (FileNotFoundException) { return current; }
+        catch (DirectoryNotFoundException) { return current; }
         catch (Exception failure)
         {
             legacyError = "Не удалось прочитать history-v1.json: " + failure.Message;
@@ -140,24 +181,40 @@ internal sealed class HistoryStore
     }
 
     public async Task<HistoryPoint[]> ReadAsync() { await loading.ConfigureAwait(false); return Read(); }
-    public bool OwnsPath(string candidate) => new[] { path, legacyPath }.Any(owned =>
-        Path.GetFullPath(candidate).Equals(Path.GetFullPath(owned), StringComparison.OrdinalIgnoreCase));
+    public bool OwnsPath(string candidate)
+    {
+        string fullPath = Path.GetFullPath(candidate);
+        return new[] { path, legacyPath }.Select(Path.GetFullPath).Any(owned =>
+            fullPath.Equals(owned, StringComparison.OrdinalIgnoreCase) ||
+            fullPath.StartsWith(owned + RecoverySuffix, StringComparison.OrdinalIgnoreCase) &&
+            Guid.TryParseExact(fullPath.AsSpan(owned.Length + RecoverySuffix.Length), "N", out _));
+    }
 
-    public async Task FlushAsync()
+    public async Task<HistorySaveResult> FlushAsync()
     {
         await loading.ConfigureAwait(false);
-        if (invalidOnLoad) return;
         await disk.WaitAsync().ConfigureAwait(false);
         try
         {
             await Task.Run(Flush).ConfigureAwait(false);
+            return new();
         }
-        catch (Exception failure) { Fail(failure); }
+        catch (Exception failure)
+        {
+            Fail(failure);
+            return new(failure.Message);
+        }
         finally { disk.Release(); }
     }
 
     void Flush()
     {
+        if (unreadableArchive is { } problem)
+        {
+            lock (gate) if (pending.Count == 0) return;
+            RecoverArchive(problem);
+        }
+
         HistoryPoint[] current;
         HistoryRetention strategy;
         long endOfBatch;
@@ -177,7 +234,7 @@ internal sealed class HistoryStore
         using var encoded = new MemoryStream();
         while (!HistoryJournal.TryEncode(compact, encoded))
             compact = compact.Skip(Math.Max(1, compact.Length / 10)).ToArray();
-        AtomicJson.WriteFile(path, stream => encoded.CopyTo(stream));
+        WriteArchive(encoded);
         var range = HistoryModel.RecordedRange(compact);
         lock (gate)
         {
@@ -186,13 +243,100 @@ internal sealed class HistoryStore
             rollbackRowsPending = false;
             DiscardPending((int)Math.Clamp(endOfBatch - removedPending, 0, pending.Count));
             revision++;
-            error = null;
+            saveError = null;
         }
         if (legacyLoaded)
         {
             File.Delete(legacyPath);
             legacyLoaded = false;
         }
+    }
+
+    void RecoverArchive(UnreadableArchive problem)
+    {
+        if (problem.Failure is IOException or UnauthorizedAccessException)
+        {
+            // Retry access errors before deciding whether the file contains a readable archive.
+            if (LoadArchive(problem.Path))
+            {
+                if (unreadableArchive is not { } latest) return;
+                if (latest.Failure is not (InvalidDataException or JsonException)) throw latest.WriteBlocked();
+            }
+        }
+        else if (problem.Failure is not (InvalidDataException or JsonException)) throw problem.WriteBlocked();
+
+        // A superseded v1 file must not be loaded as active history if recovery stops before publishing the replacement.
+        if (problem.Path == path) PreserveRollbackArchive();
+        PreserveArchive(problem.Path);
+        createRecoveredArchive = true;
+        lock (gate)
+        {
+            unreadableArchive = null;
+            revision++;
+        }
+    }
+
+    void PreserveRollbackArchive()
+    {
+        try { HistoryJournal.ReadLegacy(legacyPath); }
+        catch (FileNotFoundException) { return; }
+        catch (DirectoryNotFoundException) { return; }
+        catch (UnsupportedHistoryVersionException failure)
+        {
+            legacyError = new UnreadableArchive(legacyPath, failure).Message;
+            return;
+        }
+        catch (Exception failure) when (failure is InvalidDataException or JsonException)
+        {
+            DiagnosticLog.Write(failure.ToString());
+        }
+        catch (Exception failure) when (failure is IOException or UnauthorizedAccessException)
+        {
+            throw new UnreadableArchive(legacyPath, failure).WriteBlocked();
+        }
+        PreserveArchive(legacyPath);
+    }
+
+    void PreserveArchive(string source)
+    {
+        string preserved = source + RecoverySuffix + Guid.NewGuid().ToString("N");
+        try
+        {
+            if ((File.GetAttributes(source) & FileAttributes.Directory) != 0)
+                throw new IOException("Путь к файлу истории занят папкой.");
+            File.Move(source, preserved);
+        }
+        catch (FileNotFoundException) { return; }
+        catch (DirectoryNotFoundException) { return; }
+        catch (Exception failure) when (failure is IOException or UnauthorizedAccessException)
+        {
+            throw new InvalidDataException($"Не удалось сохранить исходный файл истории «{Path.GetFileName(source)}». " +
+                $"Новые показания не записаны. {failure.Message}", failure);
+        }
+        lock (gate)
+        {
+            string notice = $"Исходный файл истории сохранён отдельно под именем «{Path.GetFileName(preserved)}».";
+            recoveryNotice = recoveryNotice is null ? notice : $"{recoveryNotice}\n{notice}";
+            revision++;
+        }
+    }
+
+    void WriteArchive(MemoryStream encoded)
+    {
+        if (!createRecoveredArchive)
+        {
+            AtomicJson.WriteFile(path, stream => encoded.CopyTo(stream));
+            return;
+        }
+
+        string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            AtomicJson.WriteFile(temporary, stream => encoded.CopyTo(stream));
+            File.Move(temporary, path);
+            createRecoveredArchive = false;
+        }
+        finally { File.Delete(temporary); }
     }
 
     void DiscardPending(int count)
@@ -205,11 +349,11 @@ internal sealed class HistoryStore
     public async Task ClearAsync()
     {
         await loading.ConfigureAwait(false);
-        if (invalidOnLoad || legacyError != null)
-            throw new InvalidDataException("Исходный файл истории сохранён. Скопируйте или переместите его отдельно после выхода из AirDesk.");
         await disk.WaitAsync().ConfigureAwait(false);
         try
         {
+            if (unreadableArchive != null || legacyError != null || createRecoveredArchive)
+                throw new InvalidDataException("Исходный файл истории сохранён. Скопируйте или переместите его отдельно после выхода из AirDesk.");
             await Task.Run(() =>
             {
                 lock (gate)
@@ -221,13 +365,13 @@ internal sealed class HistoryStore
                     revision++;
                     lastSample = DateTimeOffset.UtcNow;
                 }
-                error = null;
+                saveError = null;
             }).ConfigureAwait(false);
         }
         finally { disk.Release(); }
     }
 
-    public Task StopAsync()
+    public Task<HistorySaveResult> StopAsync()
     {
         lock (gate) stopped = true;
         return FlushAsync();
@@ -237,8 +381,8 @@ internal sealed class HistoryStore
     {
         lock (gate)
         {
-            if (error != failure.Message) revision++;
-            error = failure.Message;
+            if (saveError != failure.Message) revision++;
+            saveError = failure.Message;
         }
         DiagnosticLog.Write(failure.ToString());
     }

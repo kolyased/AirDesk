@@ -56,6 +56,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     public static readonly TimeSpan TestDuration = TimeSpan.FromSeconds(8);
     static readonly TimeSpan RestoreWindow = TimeSpan.FromSeconds(3);
     static readonly TimeSpan IdleScanInterval = TimeSpan.FromMilliseconds(650);
+    static readonly TimeSpan WriteScanLifetime = TimeSpan.FromMilliseconds(250);
     FanSample? sample;
     TimeSpan? lastPoll, lastWrite, testEnd, restoreAt;
     TimeSpan? nextIdleScan;
@@ -246,7 +247,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
                 throw new InvalidOperationException("На выбранном минимуме контроллер уже подтвердил 100%. Тест остановлен.");
             SetAction($"Калибровка: проверяется удержание оборотов на {proposal.Floor:0.#}%.");
         }
-        catch (Exception error) { Interrupt(error.Message, false); }
+        catch (Exception error) { Interrupt(error.Message, false); throw; }
     }
 
     Calibration? pendingProposal;
@@ -390,6 +391,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
 
     void Capture(ChannelIdentity identity)
     {
+        RefreshConflict();
         Guard(false);
         output.Acquire();
         try { store.MarkCapture(identity); }
@@ -407,9 +409,12 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     float Write(float target, bool emergency = false, bool verifyInitialFloor = false)
     {
         SetAction($"Команда принята: {target:0}%.");
+        var scanStarted = clock();
+        RefreshConflict();
+        GuardWrite(emergency, scanStarted);
         float? duty = output.Write(target, liveDuty =>
         {
-            Guard(emergency);
+            GuardWrite(emergency, scanStarted);
             if (verifyInitialFloor && (!(liveDuty is >= 0 and <= 100) || target < liveDuty))
                 throw new InvalidOperationException("Начальный уровень калибровки не подтверждён: проверьте текущий выход BIOS/EC и повторите тест.");
         });
@@ -424,9 +429,16 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
         return measured;
     }
 
+    void GuardWrite(bool emergency, TimeSpan scanStarted)
+    {
+        Guard(emergency);
+        var scanAge = clock() - scanStarted;
+        if (scanAge < TimeSpan.Zero || scanAge >= WriteScanLifetime)
+            throw new InvalidOperationException("Проверка конфликтов устарела. Запись отменена.");
+    }
+
     void Guard(bool emergency)
     {
-        RefreshConflict();
         if (conflict != null) throw new InvalidOperationException(conflict);
         if (closed || stopRequested() || restoring || testEnd is { } end && clock() >= end)
             throw new InvalidOperationException("Команда отменена или время теста истекло.");
