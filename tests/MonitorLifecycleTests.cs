@@ -213,7 +213,8 @@ public sealed class MonitorLifecycleTests
             return new(Channel, 40, 1200, duty, true, "");
         }
         public void Acquire() { }
-        public float? Write(float percent, Action guard) { guard(); duty = percent; Writes.Enqueue(percent); return percent; }
+        public void AcquireRecoveryLease() { }
+        public float? Write(float percent, Action<float?> guard) { guard(duty); duty = percent; Writes.Enqueue(percent); return percent; }
         public RestoreResult Restore() { duty = 55; Interlocked.Increment(ref Restores); return new(true, true, "confirmed"); }
         public void ReleaseLease() { }
         public void Dispose() => Interlocked.Increment(ref Disposals);

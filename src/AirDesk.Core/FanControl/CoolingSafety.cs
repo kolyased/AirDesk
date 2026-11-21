@@ -32,8 +32,9 @@ public record CoolingView(ChannelState State, string Reason, string Action, stri
 public interface IFanController
 {
     void Acquire();
-    // The backend calls guard after acquiring the bus, immediately before the software write.
-    float? Write(float percent, Action guard);
+    void AcquireRecoveryLease();
+    // The backend supplies the live duty to the guard under the bus lock before writing.
+    float? Write(float percent, Action<float?> guard);
     RestoreResult Restore();
     void ReleaseLease();
 }
@@ -241,7 +242,7 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
             testEnd = clock() + TestDuration;
             testingFloor = true;
             requested = proposal.Floor;
-            if (Write(proposal.Floor) >= 100)
+            if (Write(proposal.Floor, verifyInitialFloor: true) >= 100)
                 throw new InvalidOperationException("На выбранном минимуме контроллер уже подтвердил 100%. Тест остановлен.");
             SetAction($"Калибровка: проверяется удержание оборотов на {proposal.Floor:0.#}%.");
         }
@@ -403,10 +404,15 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
         curveTemperature = null;
     }
 
-    float Write(float target, bool emergency = false)
+    float Write(float target, bool emergency = false, bool verifyInitialFloor = false)
     {
         SetAction($"Команда принята: {target:0}%.");
-        float? duty = output.Write(target, () => Guard(emergency));
+        float? duty = output.Write(target, liveDuty =>
+        {
+            Guard(emergency);
+            if (verifyInitialFloor && (!(liveDuty is >= 0 and <= 100) || target < liveDuty))
+                throw new InvalidOperationException("Начальный уровень калибровки не подтверждён: проверьте текущий выход BIOS/EC и повторите тест.");
+        });
         sentCommand = target;
         log($"Команда передана драйверу: {target:0}%.");
         if (duty is not float measured || !float.IsFinite(measured) || Math.Abs(measured - target) > 2)
@@ -488,8 +494,13 @@ public sealed class CoolingSafety(IFanController output, ICalibrationStore store
     {
         RefreshConflict();
         if (!View().CanRecover) throw new InvalidOperationException(conflict ?? "Нельзя снять блокировку сейчас.");
-        store.ClearBinding();
-        store.ClearCapture();
+        output.AcquireRecoveryLease();
+        try
+        {
+            store.ClearBinding();
+            store.ClearCapture();
+        }
+        finally { output.ReleaseLease(); }
         verified = candidate = null;
         fault = null;
         SetAction("Подтверждена проверка BIOS/EC. Перед записью нужна новая калибровка.");

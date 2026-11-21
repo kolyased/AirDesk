@@ -40,6 +40,39 @@ public sealed class SafetyTests
         Assert.False(rig.Store.RecoveryPending);
     }
 
+    [Theory]
+    [InlineData(80f)]
+    [InlineData(null)]
+    public void CalibrationRequiresALiveFirmwareOutputAtOrBelowTheFloor(float? liveDuty)
+    {
+        var rig = new Rig();
+        rig.Seed();
+        Assert.True(rig.Safety.View().CanCalibrate);
+        rig.Output.BeforeGuard = () => rig.Output.LiveDuty = liveDuty;
+
+        rig.Safety.BeginCalibration(Profile);
+        rig.Safety.Tick();
+
+        Assert.Empty(rig.Output.Writes);
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.False(rig.Store.RecoveryPending);
+        Assert.False(rig.Safety.View().CanSave);
+    }
+
+    [Fact]
+    public void RecoveryCannotRemoveTheMarkerWhileAnotherSessionOwnsCooling()
+    {
+        var rig = new Rig(Profile);
+        rig.Store.RecoveryPending = true;
+        rig.Output.RecoveryLeaseBusy = true;
+        Assert.True(rig.Safety.View().CanRecover);
+
+        Reject(rig.Safety.AcknowledgeRecovery);
+
+        Assert.True(rig.Store.RecoveryPending);
+        Assert.Equal(Profile, rig.Store.Saved);
+    }
+
     [Fact]
     public void CalibrationDeadlineIsExactlyEightSeconds()
     {
@@ -553,11 +586,17 @@ public sealed class SafetyTests
         public List<float> Writes { get; } = new();
         public int Restores, RestoreFailures;
         public bool ReadbackMatches = true;
+        public bool RecoveryLeaseBusy;
         public float? ReadbackOverride;
+        public float? LiveDuty = 60;
         public Action? BeforeGuard;
         public void Acquire() { }
+        public void AcquireRecoveryLease()
+        {
+            if (RecoveryLeaseBusy) throw new InvalidOperationException("Another session owns cooling.");
+        }
         public void ReleaseLease() { }
-        public float? Write(float percent, Action guard) { BeforeGuard?.Invoke(); guard(); Writes.Add(percent); return ReadbackMatches ? ReadbackOverride ?? percent : null; }
+        public float? Write(float percent, Action<float?> guard) { BeforeGuard?.Invoke(); guard(LiveDuty); Writes.Add(percent); return ReadbackMatches ? ReadbackOverride ?? percent : null; }
         public RestoreResult Restore() => ++Restores <= RestoreFailures ? new(false, false, "fault") : new(true, true, "confirmed");
     }
 

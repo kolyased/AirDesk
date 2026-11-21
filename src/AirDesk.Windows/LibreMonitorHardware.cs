@@ -139,7 +139,8 @@ internal sealed class LibreMonitorHardware : IMonitorHardware
     public bool RetryDiscovery => cooling.RetryDiscovery;
     public FanSample Sample(Telemetry telemetry) => cooling.Sample(telemetry);
     public void Acquire() => cooling.Acquire();
-    public float? Write(float percent, Action guard) => cooling.Write(percent, guard);
+    public void AcquireRecoveryLease() => cooling.AcquireRecoveryLease();
+    public float? Write(float percent, Action<float?> guard) => cooling.Write(percent, guard);
     public RestoreResult Restore() => cooling.Restore();
     public void ReleaseLease() => cooling.ReleaseLease();
 
