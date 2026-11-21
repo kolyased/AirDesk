@@ -58,7 +58,7 @@ try {
     $runtimeLibraries = ($deps.targets.PSObject.Properties[$deps.runtimeTarget.name].Value).PSObject.Properties.Name
     $approved = @('BlackSharp.Core/1.0.7', 'DiskInfoToolkit/1.1.2', 'HidSharp/2.6.4', 'LibreHardwareMonitorLib/0.9.6',
         'Mono.Posix.NETStandard/1.0.0', 'RAMSPDToolkit-NDD/1.4.2', 'System.IO.Ports/10.0.3', 'System.Management/10.0.2')
-    $actual = @($runtimeLibraries | Where-Object { $_ -notmatch '^runtimepack\.|^AirDesk(?:\.Core)?/' })
+    $actual = @($runtimeLibraries | Where-Object { $_ -notmatch '^runtimepack\.|^AirDesk(?:\.Core|\.Windows)?/' })
     if (Compare-Object $approved $actual) { throw 'Published dependencies changed. Review their sources and licenses before packaging.' }
 
     $licenses = Join-Path $app 'licenses'
@@ -87,7 +87,7 @@ try {
         "Working tree changes: $([bool]$dirty.Count)") | Set-Content -LiteralPath (Join-Path $app 'BUILD.txt') -Encoding utf8
 
     if ($CertificateThumbprint) {
-        foreach ($file in 'AirDesk.exe','AirDesk.dll','AirDesk.Core.dll') {
+        foreach ($file in 'AirDesk.exe','AirDesk.dll','AirDesk.Core.dll','AirDesk.Windows.dll') {
             $path = Join-Path $app $file
             Invoke-Checked $SignTool @('sign','/sha1',$CertificateThumbprint,'/fd','SHA256','/tr',$TimestampUrl,'/td','SHA256',$path)
             Require-Signature $path

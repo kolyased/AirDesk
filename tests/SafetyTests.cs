@@ -7,7 +7,7 @@ using Xunit;
 public sealed class SafetyTests
 {
     static readonly ChannelIdentity Id = new("Intel", "X99", "2", "5.11", "Nuvoton", "/control/1", "/fan/1", "CPU", "PawnIO 2.2", "0.9.6", 1);
-    static readonly Calibration Profile = new(Id, "Радиатор", "SYS_FAN, PWM hub", SignalMode.Pwm, 65);
+    static readonly Calibration Profile = new(Id, "Радиатор", "SYS_FAN, PWM hub", SignalMode.Pwm, 65) { RangeVerified = true };
     static readonly FanProfile Manual = FanProfile.Default with { Kind = ProfileKind.Manual, Manual = 42 };
     static readonly SensorReference Gpu = new("gpu-temperature", "gpu0", "Card 1");
 
@@ -40,6 +40,39 @@ public sealed class SafetyTests
         Assert.False(rig.Store.RecoveryPending);
     }
 
+    [Theory]
+    [InlineData(80f)]
+    [InlineData(null)]
+    public void CalibrationRequiresALiveFirmwareOutputAtOrBelowTheFloor(float? liveDuty)
+    {
+        var rig = new Rig();
+        rig.Seed();
+        Assert.True(rig.Safety.View().CanCalibrate);
+        rig.Output.BeforeGuard = () => rig.Output.LiveDuty = liveDuty;
+
+        rig.Safety.BeginCalibration(Profile);
+        rig.Safety.Tick();
+
+        Assert.Empty(rig.Output.Writes);
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.False(rig.Store.RecoveryPending);
+        Assert.False(rig.Safety.View().CanSave);
+    }
+
+    [Fact]
+    public void RecoveryCannotRemoveTheMarkerWhileAnotherSessionOwnsCooling()
+    {
+        var rig = new Rig(Profile);
+        rig.Store.RecoveryPending = true;
+        rig.Output.RecoveryLeaseBusy = true;
+        Assert.True(rig.Safety.View().CanRecover);
+
+        Reject(rig.Safety.AcknowledgeRecovery);
+
+        Assert.True(rig.Store.RecoveryPending);
+        Assert.Equal(Profile, rig.Store.Saved);
+    }
+
     [Fact]
     public void CalibrationDeadlineIsExactlyEightSeconds()
     {
@@ -53,6 +86,100 @@ public sealed class SafetyTests
         rig.Advance(.01);
         Assert.Equal(1, rig.Output.Restores);
         Assert.True(rig.Safety.View().CanSave);
+    }
+
+    [Fact]
+    public void CalibrationCannotSaveWhenMaximumMatchesTheChosenFloorRpm()
+    {
+        var rig = new Rig();
+        rig.Seed();
+        rig.Safety.BeginCalibration(Profile);
+        for (int i = 0; i < 3; i++) rig.Advance(1, rpm: 1800, duty: 65);
+        for (int i = 0; i < 4; i++) rig.Advance(1, rpm: 1800, duty: 100);
+        rig.Advance(1);
+
+        Assert.Equal(new[] { 65f, 100f }, rig.Output.Writes);
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.False(rig.Safety.View().CanSave);
+        Assert.Null(rig.Store.Saved);
+    }
+
+    [Fact]
+    public void CalibrationAtOneHundredPercentCannotEstablishAnOperatingRange()
+    {
+        var rig = new Rig();
+        rig.Seed();
+
+        Reject(() => rig.Safety.BeginCalibration(Profile with { Floor = 100 }));
+        Assert.Empty(rig.Output.Writes);
+        Assert.False(rig.Store.RecoveryPending);
+    }
+
+    [Theory]
+    [InlineData(65)]
+    [InlineData(99)]
+    public void CalibrationStopsWhenOutputDoesNotMatchDuringMeasurement(float floor)
+    {
+        var rig = new Rig();
+        rig.Seed();
+        rig.Safety.BeginCalibration(Profile with { Floor = floor });
+        for (int i = 0; i < 3; i++) rig.Advance(1, rpm: 1370, duty: floor);
+        rig.Advance(1, rpm: 1800, duty: floor);
+
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.False(rig.Safety.View().CanSave);
+        Assert.False(rig.Store.RecoveryPending);
+    }
+
+    [Fact]
+    public void CalibrationStopsWhenFloorAlreadyReadsBackAsFullOutput()
+    {
+        var rig = new Rig();
+        rig.Seed();
+        rig.Output.ReadbackOverride = 100;
+        rig.Safety.BeginCalibration(Profile with { Floor = 99.8f });
+
+        Assert.Equal(ChannelState.Restoring, rig.Safety.View().State);
+        rig.Safety.Tick();
+        Assert.Equal(new[] { 99.8f }, rig.Output.Writes);
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.False(rig.Safety.View().CanSave);
+        Assert.False(rig.Store.RecoveryPending);
+    }
+
+    [Fact]
+    public void CalibrationStopsWhenFullOutputCannotBeConfirmed()
+    {
+        var rig = new Rig();
+        rig.Seed();
+        rig.Safety.BeginCalibration(Profile);
+        rig.Output.ReadbackOverride = 99;
+        for (int i = 0; i < 3; i++) rig.Advance(1, rpm: 1370, duty: 65);
+
+        Assert.Equal(new[] { 65f, 100f }, rig.Output.Writes);
+        Assert.Equal(1, rig.Output.Restores);
+        Assert.False(rig.Safety.View().CanSave);
+    }
+
+    [Fact]
+    public void CalibrationIsUnavailableWhenBiosLeavesNoUsableFloor()
+    {
+        var rig = new Rig();
+        for (int i = 0; i < 3; i++) rig.Observe(duty: 99.1f);
+
+        Assert.False(rig.Safety.View().CanCalibrate);
+        Assert.Empty(rig.Output.Writes);
+    }
+
+    [Fact]
+    public void ABindingWithoutRangeVerificationRequiresRecalibration()
+    {
+        var rig = new Rig(Profile with { RangeVerified = false });
+
+        Assert.False(rig.Safety.View().CanConfirm);
+        Reject(rig.Safety.ConfirmUnchangedTopology);
+        Reject(() => rig.Safety.Enable(Manual));
+        Assert.Empty(rig.Output.Writes);
     }
 
     [Fact]
@@ -155,7 +282,7 @@ public sealed class SafetyTests
         rig.Seed();
         Reject(() => rig.Safety.BeginCalibration(Profile with { Signal = SignalMode.Unknown }));
         Reject(() => rig.Safety.BeginCalibration(Profile with { Floor = 59 }));
-        rig.Safety.BeginCalibration(Profile);
+        rig.Safety.BeginCalibration(Profile with { RangeVerified = false });
         Check(rig.Output.Writes.SequenceEqual([65f]), "Calibration starts at a user-confirmed floor above the autonomous output");
         for (int i = 0; i < 3; ++i) rig.Advance(1, rpm: 1370, duty: 65);
         Check(rig.Output.Writes.SequenceEqual([65f, 100]), "Calibration raises to 100% after floor checks");
@@ -180,11 +307,51 @@ public sealed class SafetyTests
     }
 
     [Fact]
+    public void RepeatedIdleTicksShareOneProcessScan()
+    {
+        var rig = new Rig();
+        rig.Safety.Tick();
+        rig.Conflict = "FanControl";
+        rig.Safety.Tick();
+        Assert.Equal(1, rig.ConflictScans);
+        Assert.Null(rig.Safety.View().Conflict);
+        rig.PassTime(.85);
+        rig.Safety.Tick();
+        Assert.Equal(2, rig.ConflictScans);
+        Assert.Equal("FanControl", rig.Safety.View().Conflict);
+    }
+
+    [Fact]
+    public void EnableRefreshesConflictAfterIdleScan()
+    {
+        var rig = new Rig(Profile);
+        rig.Safety.ConfirmUnchangedTopology();
+        rig.Safety.Tick();
+        rig.Conflict = "FanControl.Service";
+        Reject(() => rig.Safety.Enable(Manual));
+        Assert.Equal("FanControl.Service", rig.Safety.View().Conflict);
+        Assert.Empty(rig.Output.Writes);
+    }
+
+    [Fact]
+    public void RecoveryAcknowledgmentRefreshesConflictAfterIdleScan()
+    {
+        var rig = new Rig(Profile, recovery: true);
+        rig.Safety.Tick();
+        Assert.True(rig.Safety.View().CanRecover);
+        rig.Conflict = "FanControl.Service";
+        Reject(rig.Safety.AcknowledgeRecovery);
+        Assert.True(rig.Store.RecoveryPending);
+        Assert.False(rig.Safety.View().CanRecover);
+    }
+
+    [Fact]
     public void ConflictAtWriteGuardBlocksWrite()
     {
         var rig = new Rig(Profile);
         Reject(() => rig.Safety.Enable(Manual));
         rig.Safety.ConfirmUnchangedTopology();
+        rig.Safety.Tick();
         rig.Output.BeforeGuard = () => rig.Conflict = "FanControl.Service";
         Reject(() => rig.Safety.Enable(Manual));
         rig.Safety.Tick();
@@ -260,12 +427,17 @@ public sealed class SafetyTests
         Check(rig.Output.Writes.Count == 1 && rig.Output.Restores == 1, "Changed identity revokes binding without speed command");
     }
 
-    [Fact]
-    public void MissingSecondarySourceTriggersEmergency()
+    [Theory]
+    [InlineData(null)]
+    [InlineData(float.NaN)]
+    [InlineData(float.PositiveInfinity)]
+    [InlineData(float.NegativeInfinity)]
+    [InlineData(126f)]
+    public void InvalidSecondarySourceTriggersEmergencyAndRestore(float? temperature)
     {
         var rig = Rig.Active();
         rig.Safety.Adjust(FanProfile.Default with { Secondary = Gpu });
-        rig.Observe(gpu: null, duty: rig.Output.Writes.Last());
+        rig.Observe(gpu: temperature, duty: rig.Output.Writes.Last());
         rig.Safety.Tick();
         Check(rig.Output.Writes.Last() == 100 && rig.Output.Restores == 1, "Missing one source of a maximum fails safe");
     }
@@ -304,6 +476,35 @@ public sealed class SafetyTests
     }
 
     [Fact]
+    public void CurveFeedbackUsesResolvedSourceAndReportsIndependentCpuProtection()
+    {
+        var rig = Rig.Active();
+        rig.Safety.Adjust(FanProfile.Default with { Primary = Gpu });
+        rig.Observe(cpu: 85, gpu: 50, duty: rig.Output.Writes.Last());
+        rig.Safety.Tick();
+        var active = rig.Safety.View();
+
+        Assert.Equal(50, active.CurveTemperature);
+        Assert.Equal(65, active.VerifiedFloor);
+        Assert.Equal(100, active.Command);
+        Assert.True(active.TemperatureProtection);
+
+        rig.Observe(cpu: 84, gpu: 51, duty: 100);
+        rig.Safety.Tick();
+        Assert.True(rig.Safety.View().TemperatureProtection);
+
+        rig.Observe(cpu: 83, gpu: 52, duty: 100);
+        rig.Safety.Tick();
+        Assert.False(rig.Safety.View().TemperatureProtection);
+        Assert.Equal(100, rig.Safety.View().Command);
+
+        rig.Observe(gpu: null, duty: 100);
+        rig.Safety.Tick();
+        Assert.Null(rig.Safety.View().CurveTemperature);
+        Assert.False(rig.Safety.View().TemperatureProtection);
+    }
+
+    [Fact]
     public void TelemetryPreservesIdentityAndQuality()
     {
         var first = new Reading("RTX", "/gpu-nvidia/1", "GpuNvidia", "GPU Core", "Temperature", "°C", 76, "/gpu-nvidia/1/temperature/0", ReadingQuality.Fresh, DateTimeOffset.UtcNow);
@@ -315,7 +516,7 @@ public sealed class SafetyTests
         var devices = new HashSet<(string, string)> { (first.DeviceId, first.Device) };
         var completed = first.UpdatedAt!.Value.AddSeconds(5);
         var late = Reading.MergePoll([first], [], devices, completed, TimeSpan.FromSeconds(4)).Single();
-        Check(late.Quality == ReadingQuality.Stale && !late.Available && new Telemetry([late]).CurveSources.Single().Celsius == null,
+        Check(late.Quality == ReadingQuality.Stale && !late.Available && new Telemetry([late with { DeviceInstance = @"PCI\VEN_10DE&DEV_2882\4&00001&0&0008" }]).CurveSources.Single().Celsius == null,
             "An old sample cannot drive a curve after a slow poll");
         var denied = Reading.MergePoll([first with { Value = null, UpdatedAt = null, Quality = ReadingQuality.AccessDenied }],
             [first], devices, completed, TimeSpan.FromSeconds(4)).Single();
@@ -347,14 +548,20 @@ public sealed class SafetyTests
     {
         TimeSpan time;
         public string? Conflict;
+        public int ConflictScans;
         public Output Output { get; } = new();
         public Store Store { get; }
         public CoolingSafety Safety { get; }
         public Rig(Calibration? saved = null, bool recovery = false)
         {
             Store = new() { Saved = saved, RecoveryPending = recovery };
-            Safety = new(Output, Store, () => Conflict, () => time, _ => { }, () => false);
+            Safety = new(Output, Store, Scan, () => time, _ => { }, () => false);
             if (saved != null) Seed();
+        }
+        string? Scan()
+        {
+            ConflictScans++;
+            return Conflict;
         }
         public static Rig Active()
         {
@@ -379,10 +586,17 @@ public sealed class SafetyTests
         public List<float> Writes { get; } = new();
         public int Restores, RestoreFailures;
         public bool ReadbackMatches = true;
+        public bool RecoveryLeaseBusy;
+        public float? ReadbackOverride;
+        public float? LiveDuty = 60;
         public Action? BeforeGuard;
         public void Acquire() { }
+        public void AcquireRecoveryLease()
+        {
+            if (RecoveryLeaseBusy) throw new InvalidOperationException("Another session owns cooling.");
+        }
         public void ReleaseLease() { }
-        public float? Write(float percent, Action guard) { BeforeGuard?.Invoke(); guard(); Writes.Add(percent); return ReadbackMatches ? percent : null; }
+        public float? Write(float percent, Action<float?> guard) { BeforeGuard?.Invoke(); guard(LiveDuty); Writes.Add(percent); return ReadbackMatches ? ReadbackOverride ?? percent : null; }
         public RestoreResult Restore() => ++Restores <= RestoreFailures ? new(false, false, "fault") : new(true, true, "confirmed");
     }
 

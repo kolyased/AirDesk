@@ -34,8 +34,11 @@ public static class Program
         using var signal = new EventWaitHandle(false, EventResetMode.AutoReset, ActivationEvent);
         var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
         bool fixture = args.Contains("--ui-smoke");
-        var window = new Dashboard(autostart || benchmark || soak || fixture, benchmark || soak || fixture,
-            args.Contains("--record-history"), args.Contains("--monitor-only"));
+        bool isolated = benchmark || soak || fixture;
+        bool autostartSession = autostart || isolated;
+        var session = new MonitoringSession(WindowsMonitoring.Create(autostartSession || args.Contains("--monitor-only")),
+            isolated ? System.IO.Path.Combine(AppContext.BaseDirectory, "benchmark-history") : null);
+        var window = new Dashboard(session, DriverStatus.Read(), autostartSession, isolated, args.Contains("--record-history"));
         var activation = ThreadPool.RegisterWaitForSingleObject(signal, (_, _) =>
         {
             if (!app.Dispatcher.HasShutdownStarted) app.Dispatcher.BeginInvoke(window.ActivateFromSecondLaunch);

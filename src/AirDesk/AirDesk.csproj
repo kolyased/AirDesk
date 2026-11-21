@@ -11,6 +11,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../AirDesk.Core/AirDesk.Core.csproj" />
-    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
+    <ProjectReference Include="../AirDesk.Windows/AirDesk.Windows.csproj" />
   </ItemGroup>
 </Project>

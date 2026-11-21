@@ -1,6 +1,8 @@
 # Сборка и публикация AirDesk
 
-Канонический исходный код находится в репозитории [kolyased/AirDesk](https://github.com/kolyased/AirDesk). Основная ветка — `main`. До слияния работа над безопасностью и тестовые сборки идут из `safety/hardware-control`. Единственный номер версии задаётся в `Directory.Build.props`. Сборка записывает полный Git SHA в свойства `AirDesk.exe` и `BUILD.txt`. Старые локальные каталоги и архивы определяются по этим данным, а для сборок без SHA — по содержимому и контрольной сумме.
+Канонический исходный код находится в репозитории [kolyased/AirDesk](https://github.com/kolyased/AirDesk). Основная ветка — `main`. До слияния тестовые сборки доступны из рабочей ветки. Единственный номер версии задаётся в `Directory.Build.props`. Сборка записывает полный Git SHA в свойства `AirDesk.exe` и `BUILD.txt`. Старые локальные каталоги и архивы определяются по этим данным, а для сборок без SHA — по содержимому и контрольной сумме.
+
+Для слияния в `main` нужен pull request с актуальной базой и успешными заданиями `unit`, `analysis`, `desktop`, `publish` и `windows-11-installer`.
 
 На Windows используйте .NET 10 SDK и PowerShell 7. Для установщика нужен проверенный Inno Setup. Версия 6.7.4 использовалась для проверки. Требования его лицензии к коммерческому использованию действуют отдельно. [Загрузка и проверка Inno Setup](https://jrsoftware.org/inno-setup/downloads)
 
@@ -12,6 +14,14 @@ pwsh -File scripts/Test-Package.ps1
 ```
 
 Без параметра `-Iscc` создаётся Portable ZIP. При сборке обоих пакетов установщик и ZIP используют одну папку публикации, включая локальный .NET, инструкции и лицензии. Скрипт сверяет опубликованные зависимости, версию, Git SHA и отсутствие отдельного драйвера PawnIO. Статус подписей и модификаций рабочей копии указан в `BUILD.txt`. SHA-256 обоих пакетов находится в `AirDesk-<версия>-SHA256.txt`.
+
+Задание `windows-11-installer` рассчитано на установку x64-пакета на Windows 11 ARM64 под эмуляцией x64. В артефакте `AirDesk-Windows-11-installer-evidence` сохраняются версия Windows и журналы выполненных шагов. Для ручного повтора в отдельной учётной записи используйте `scripts/Test-InstallerUpgrade.ps1` с параметрами `-PreviousSetup` и `-CurrentSetup`. [Статус заданий CI](https://github.com/kolyased/AirDesk/actions/workflows/build.yml)
+
+## Предварительный выпуск 0.7.2
+
+1. Из чистого checkout проверенного коммита соберите оба пакета командой `scripts/Package.ps1 -Iscc <путь к ISCC.exe>` и выполните `scripts/Test-Package.ps1`. Сверьте версию, Git SHA, контрольные суммы и статус подписи в `BUILD.txt`.
+2. Создайте выпуск с тегом `v0.7.2` на проверенном коммите, названием `AirDesk 0.7.2 preview` и флагом GitHub Pre-release. Прикрепите `AirDesk-0.7.2-Portable-win-x64.zip`, `AirDesk-0.7.2-Setup-win-x64.exe` и `AirDesk-0.7.2-SHA256.txt`. В описании укажите Git SHA, статус подписи и результаты проверок. [GitHub Releases](https://github.com/kolyased/AirDesk/releases) · [Журнал изменений](../CHANGELOG.md) · [Матрица готовности](readiness.md)
+3. Проверьте пометку Pre-release на странице выпуска. Встроенная проверка AirDesk пропускает предварительные релизы. Установка выполняется вручную. [Инструкция для пользователя](installation.md)
 
 ## Условия стабильной публикации
 

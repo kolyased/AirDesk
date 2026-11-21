@@ -1,5 +1,6 @@
 using System;
 using System.Globalization;
+using System.Linq;
 using AirDesk;
 using Xunit;
 
@@ -7,8 +8,18 @@ public sealed class TelemetryAndFrameTests
 {
     [Theory]
     [InlineData("fan.control.service", "FanControl")]
+    [InlineData("FanControl.exe", "FanControl")]
+    [InlineData("FaNcOnTrOl.SeRvIcE.ExE", "FanControl")]
     [InlineData("MSIAfterburner", "MSI Afterburner")]
     [InlineData("asusfancontrolservice", "ASUS Fan Xpert / AI Suite")]
+    [InlineData("NZXT CAM.exe", "NZXT CAM")]
+    [InlineData("cam_helper.exe", "NZXT CAM")]
+    [InlineData("Corsair.Service.exe", "Corsair iCUE")]
+    [InlineData("FanControlUpdater", null)]
+    [InlineData("FanControlProfileEditor.exe", null)]
+    [InlineData("MSIAfterburnerHelper", null)]
+    [InlineData("ArgusMonitorSetup", null)]
+    [InlineData("OtherCam_Helper.exe", null)]
     [InlineData("explorer", null)]
     public void ControllerRecognitionUsesProcessName(string process, string? expected)
     {
@@ -23,6 +34,21 @@ public sealed class TelemetryAndFrameTests
         Assert.Equal("—", ReadingDisplay.Value(float.NaN, "°C", culture));
         Assert.Equal("—", ReadingDisplay.Value(float.PositiveInfinity, "°C", culture));
         Assert.Equal("42,5 °C", ReadingDisplay.Value(42.5f, "°C", culture));
+    }
+
+    [Theory]
+    [InlineData(ReadingQuality.Stale)]
+    [InlineData(ReadingQuality.AccessDenied)]
+    public void RamTotalInheritsAnUnavailableInputsStatus(ReadingQuality freeQuality)
+    {
+        var used = new Reading("RAM", "/ram", "Memory", "Memory Used", "Data", "ГБ", 16, "/ram/data/0",
+            ReadingQuality.Fresh, DateTimeOffset.UtcNow);
+        var free = used with { Name = "Memory Available", Id = "/ram/data/1", Quality = freeQuality };
+
+        var total = new Telemetry([used, free]).Ram!.Details().Single(metric => metric.Label == "Всего");
+
+        Assert.Null(total.Derived);
+        Assert.Equal(freeQuality, total.Missing);
     }
 
     [Fact]

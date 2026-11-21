@@ -15,11 +15,13 @@ public sealed partial class Dashboard
     readonly ComboBox historyDevice = new() { MinWidth = 160, MaxWidth = 285 }, historySensor = new() { MinWidth = 155, MaxWidth = 285 },
         historyRange = new() { Width = 120 };
     readonly TextBlock historyInfo = Text("", 13), historyLeft = Text("", 12), historyRight = Text("", 12);
+    readonly TextBlock historyRecorded = Text("", 13), settingsHistoryRecorded = Text("", 13), historySelectionInfo = Text("", 13);
     readonly Canvas historyPlot = new() { Height = 200, ClipToBounds = true };
     bool changingHistoryFilters;
     int lastHistoryRevision = -1;
+    int lastHistorySettingsRevision = -1;
     HistoryPoint[] visibleHistory = [];
-    sealed record HistoryChoice(SensorReference? Sensor, string? DeviceId, string Label) { public override string ToString() => Label; }
+    sealed record HistoryChoice(SensorReference? Sensor, (string Id, string Name)? Device, string Label) { public override string ToString() => Label; }
 
     FrameworkElement BuildHistory()
     {
@@ -38,9 +40,11 @@ public sealed partial class Dashboard
         var axis = new DockPanel { Margin = new(0, 5, 0, 0) };
         DockPanel.SetDock(historyRight, Dock.Right); axis.Children.Add(historyRight); axis.Children.Add(historyLeft); content.Children.Add(axis);
         historyInfo.TextWrapping = TextWrapping.Wrap; content.Children.Add(historyInfo);
+        historyRecorded.TextWrapping = TextWrapping.Wrap; content.Children.Add(historyRecorded);
         var actions = new WrapPanel(); content.Children.Add(actions);
         actions.Children.Add(Button("Экспорт выборки…", () => _ = ExportHistory(visibleHistory, "AirDesk-history")));
         actions.Children.Add(Button("Очистить историю…", () => _ = ClearHistory()));
+        actions.Children.Add(Button("Датчики записи…", EditHistorySensors));
         actions.Children.Add(Button("Настроить хранение", () => Navigate(SettingsTab)));
         historyDevice.SelectionChanged += (_, _) => { if (!changingHistoryFilters) RefreshHistory(force: true); };
         historySensor.SelectionChanged += (_, _) => { if (!changingHistoryFilters) RefreshHistory(force: true); };
@@ -53,26 +57,61 @@ public sealed partial class Dashboard
 
     void RefreshHistory(bool force = false)
     {
-        if (!historyPlot.IsVisible || !force && lastHistoryRevision == viewModel.History.Revision) return;
-        lastHistoryRevision = viewModel.History.Revision;
+        int revision = viewModel.History.Revision;
+        if (settingsHistoryRecorded.IsVisible && (force || lastHistorySettingsRevision != revision))
+        {
+            lastHistorySettingsRevision = revision;
+            string savedText = viewModel.History.SavedRange is { } saved ? HistoryRangeText(saved, "Сохранено на диске") : "На диске пока нет записей.";
+            settingsHistoryRecorded.Text = viewModel.History.Error is { } error ? $"{savedText}\n{error}" : savedText;
+        }
+        if (!historyPlot.IsVisible || !force && lastHistoryRevision == revision) return;
+        lastHistoryRevision = revision;
         var all = viewModel.History.Read();
-        var device = (historyDevice.SelectedItem as HistoryChoice)?.DeviceId;
+        var device = (historyDevice.SelectedItem as HistoryChoice)?.Device;
         var sensor = (historySensor.SelectedItem as HistoryChoice)?.Sensor;
         changingHistoryFilters = true;
-        var devices = all.GroupBy(p => p.Sensor.DeviceId).Select(g => new HistoryChoice(null, g.Key, preferences.Label(g.Key, g.Last().Sensor.DeviceName)))
+        var devices = all.Select(p => (Id: p.Sensor.DeviceId, Name: p.Sensor.DeviceName)).Distinct()
+            .Select(key => new HistoryChoice(null, key, preferences.DeviceLabel(key.Id, key.Name, HistoryDeviceInstance(key.Id, key.Name)) +
+                (key.Id.StartsWith(Telemetry.GpuInstancePrefix, StringComparison.Ordinal) ? " · ID Windows" : "")))
             .OrderBy(item => item.Label, StringComparer.CurrentCulture).Prepend(new(null, null, "Все устройства")).ToArray();
-        historyDevice.ItemsSource = devices; historyDevice.SelectedItem = devices.FirstOrDefault(item => item.DeviceId == device) ?? devices[0];
-        var sensors = all.Where(p => device == null || p.Sensor.DeviceId == device).GroupBy(p => p.Sensor).Select(g =>
+        var selectedDevice = devices.FirstOrDefault(item => item.Device == device) ?? devices[0];
+        historyDevice.ItemsSource = devices; historyDevice.SelectedItem = selectedDevice;
+        var sensors = all.Where(p => selectedDevice.Device == null || (p.Sensor.DeviceId, p.Sensor.DeviceName) == selectedDevice.Device)
+            .GroupBy(p => p.Sensor).Select(g =>
         {
             var point = g.Last();
-            return new HistoryChoice(g.Key, g.Key.DeviceId, $"{preferences.Label(g.Key.DeviceId, g.Key.DeviceName)} · {preferences.Label(g.Key.Id, point.Name)}");
+            return new HistoryChoice(g.Key, (g.Key.DeviceId, g.Key.DeviceName), HistorySensorLabel(g.Key, point.Name, point.Unit,
+                HistoryDeviceInstance(g.Key.DeviceId, g.Key.DeviceName)));
         }).OrderBy(item => item.Label, StringComparer.CurrentCulture).ToArray();
         historySensor.ItemsSource = sensors; historySensor.SelectedItem = sensors.FirstOrDefault(item => item.Sensor == sensor) ?? sensors.FirstOrDefault();
         changingHistoryFilters = false;
         sensor = (historySensor.SelectedItem as HistoryChoice)?.Sensor;
         DateTimeOffset cutoff = DateTimeOffset.UtcNow - HistoryViewPeriod();
-        visibleHistory = all.Where(p => p.Sensor == sensor && p.At >= cutoff).OrderBy(p => p.At).ToArray();
+        var recorded = all.Where(p => p.Sensor == sensor).ToArray();
+        historyRecorded.Text = HistoryModel.RecordedRange(recorded) is { } range
+            ? HistoryRangeText(range, "Собраны показания") : "В истории пока нет записей.";
+        visibleHistory = recorded.Where(p => p.At >= cutoff).OrderBy(p => p.At).ToArray();
         DrawHistory();
+    }
+
+    static string HistoryRangeText((DateTimeOffset From, DateTimeOffset At) range, string label)
+    {
+        var span = range.At - range.From;
+        string duration = span.TotalDays >= 1 ? $"{span.Days} д {span.Hours} ч" :
+            span.TotalHours >= 1 ? $"{span.Hours} ч {span.Minutes} мин" :
+            span.TotalMinutes >= 1 ? $"{span.Minutes} мин {span.Seconds} с" : $"{span.Seconds} с";
+        return $"{label} с {range.From.LocalDateTime:dd.MM.yyyy HH:mm:ss} по {range.At.LocalDateTime:dd.MM.yyyy HH:mm:ss} · {duration}.";
+    }
+
+    string? HistoryDeviceInstance(string id, string name) => latest?.Telemetry.Gpus
+        .Where(device => string.Equals(device.Name, name, StringComparison.OrdinalIgnoreCase)).ToArray() is [{ Id: var found, InstanceId: var instance }]
+        && found == id ? instance : null;
+
+    string HistorySensorLabel(SensorReference sensor, string name, string unit, string? deviceInstance)
+    {
+        string device = preferences.DeviceLabel(sensor.DeviceId, sensor.DeviceName, deviceInstance);
+        string label = preferences.Label(sensor.Id, FriendlySource(name));
+        return $"{device} · {label}" + (unit.Length == 0 ? "" : $" ({unit})");
     }
 
     TimeSpan HistoryViewPeriod() => historyRange.SelectedIndex switch
@@ -86,8 +125,9 @@ public sealed partial class Dashboard
         historyLeft.Text = Stamp(start); historyRight.Text = Stamp(end);
         if (visibleHistory.Length == 0)
         {
-            historyInfo.Text = viewModel.History.Error ?? (viewModel.History.Retention == HistoryRetention.Off ?
-                "Запись истории выключена. Её можно включить в настройках." : "За выбранный период пока нет данных.");
+            historyInfo.Text = viewModel.History.Error ?? (viewModel.History.Retention == HistoryRetention.Off
+                ? "Запись истории выключена. Её можно включить в настройках."
+                : preferences.HistorySensors is { Length: 0 } ? "Датчики для записи не выбраны." : "За выбранный период пока нет данных.");
             return;
         }
         float min = visibleHistory.Min(p => p.Min), max = visibleHistory.Max(p => p.Max);
@@ -160,6 +200,6 @@ public sealed partial class Dashboard
             RefreshHistory(force: true);
         }
         catch (Exception error) { Monitor.Log(error); MessageBox.Show(this, "Не удалось очистить историю: " + error.Message); }
-        finally { viewModel.ConfigureHistory(preferences.Retention); }
+        finally { viewModel.ConfigureHistory(preferences.Retention, preferences.HistorySensors); }
     }
 }

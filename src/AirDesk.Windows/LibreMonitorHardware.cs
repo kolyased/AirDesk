@@ -2,31 +2,27 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using LibreHardwareMonitor.Hardware;
+using LibreHardwareMonitor.Hardware.Gpu;
 
 namespace AirDesk;
 
-public record SensorPoll(Telemetry Telemetry, int UpdatedDevices, int DeferredDevices, int FailedDevices);
-
-public interface ISensorProvider : IDisposable
-{
-    void Open();
-    SensorPoll Poll(TimeSpan elapsed, bool discover);
-}
-
 // All methods run on the same hardware executor as firmware writes.
-internal sealed class LibreSensorProvider(WindowsCooling cooling) : ISensorProvider
+internal sealed class LibreMonitorHardware : IMonitorHardware
 {
     sealed record Frame(Reading[] Readings, TimeSpan Next, bool Failed);
+    readonly WindowsCooling cooling = new();
     readonly Computer computer = new() { IsCpuEnabled = true, IsMotherboardEnabled = true, IsMemoryEnabled = true,
         IsGpuEnabled = true, IsStorageEnabled = true };
     readonly Dictionary<IHardware, Frame> frames = new();
+    readonly Dictionary<IHardware, string?> gpuInstances = new();
     IHardware[] devices = [];
     TimeSpan nextEnumeration;
     bool opened;
 
     public void Open()
     {
-        computer.Open(); opened = true;
+        opened = true;
+        computer.Open();
         Enumerate(); nextEnumeration = TimeSpan.FromSeconds(10);
         cooling.Discover(devices);
     }
@@ -59,7 +55,8 @@ internal sealed class LibreSensorProvider(WindowsCooling cooling) : ISensorProvi
             Reading[] readings;
             try
             {
-                readings = Reading.MergePoll(device.Sensors.Select(sensor => Normalize(device, sensor, measured, quality)).ToArray(),
+                string? instanceId = gpuInstances.GetValueOrDefault(device);
+                readings = Reading.MergePoll(device.Sensors.Select(sensor => Normalize(device, sensor, measured, quality, instanceId)).ToArray(),
                     prior, new HashSet<(string, string)> { (device.Identifier.ToString(), device.Name) }, measured,
                     Telemetry.MaxAge(device.HardwareType.ToString()));
                 if (quality != ReadingQuality.Fresh)
@@ -82,7 +79,7 @@ internal sealed class LibreSensorProvider(WindowsCooling cooling) : ISensorProvi
         return new(new Telemetry(values), updated, deferred, failed);
     }
 
-    static Reading Normalize(IHardware device, ISensor sensor, DateTimeOffset now, ReadingQuality quality)
+    static Reading Normalize(IHardware device, ISensor sensor, DateTimeOffset now, ReadingQuality quality, string? instanceId)
     {
         float? value = sensor.Value is float number && float.IsFinite(number) ? number : null;
         if (device.HardwareType == HardwareType.Storage && sensor.SensorType == SensorType.Temperature && value == 0)
@@ -102,7 +99,8 @@ internal sealed class LibreSensorProvider(WindowsCooling cooling) : ISensorProvi
         if (sensor.SensorType == SensorType.Factor && sensor.Name == "Power On Hours") unit = "ч";
         return new Reading(device.Name, device.Identifier.ToString(), device.HardwareType.ToString(), sensor.Name,
             sensor.SensorType.ToString(), unit, quality is ReadingQuality.Fresh or ReadingQuality.Unverified ? value : null,
-            sensor.Identifier.ToString(), quality, quality is ReadingQuality.Fresh or ReadingQuality.Unverified ? now : null);
+            sensor.Identifier.ToString(), quality, quality is ReadingQuality.Fresh or ReadingQuality.Unverified ? now : null)
+            { DeviceInstance = instanceId };
     }
 
     static TimeSpan Interval(HardwareType type) => TimeSpan.FromMilliseconds(type switch
@@ -114,6 +112,21 @@ internal sealed class LibreSensorProvider(WindowsCooling cooling) : ISensorProvi
     {
         devices = computer.Hardware.SelectMany(Walk).ToArray();
         foreach (var removed in frames.Keys.Except(devices).ToArray()) frames.Remove(removed);
+        foreach (var removed in gpuInstances.Keys.Except(devices).ToArray()) gpuInstances.Remove(removed);
+        foreach (var gpu in devices.OfType<GenericGpu>().Where(gpu => !gpuInstances.ContainsKey(gpu)))
+        {
+            try
+            {
+                string? id = gpu.DeviceId?.Trim().ToUpperInvariant();
+                gpuInstances.Add(gpu, id is { Length: <= 240 } && id.StartsWith(@"PCI\VEN_", StringComparison.Ordinal) &&
+                    id.Split('\\') is [_, { Length: > 0 }, { Length: > 0 }] ? id : null);
+            }
+            catch (Exception error)
+            {
+                gpuInstances.Add(gpu, null);
+                Monitor.Log(error);
+            }
+        }
     }
 
     static IEnumerable<IHardware> Walk(IHardware hardware)
@@ -123,5 +136,20 @@ internal sealed class LibreSensorProvider(WindowsCooling cooling) : ISensorProvi
             foreach (var item in Walk(child)) yield return item;
     }
 
-    public void Dispose() { if (opened) { opened = false; computer.Close(); } }
+    public bool RetryDiscovery => cooling.RetryDiscovery;
+    public FanSample Sample(Telemetry telemetry) => cooling.Sample(telemetry);
+    public void Acquire() => cooling.Acquire();
+    public void AcquireRecoveryLease() => cooling.AcquireRecoveryLease();
+    public float? Write(float percent, Action<float?> guard) => cooling.Write(percent, guard);
+    public RestoreResult Restore() => cooling.Restore();
+    public void ReleaseLease() => cooling.ReleaseLease();
+
+    public void Dispose()
+    {
+        try
+        {
+            if (opened) { opened = false; computer.Close(); }
+        }
+        finally { cooling.Dispose(); }
+    }
 }

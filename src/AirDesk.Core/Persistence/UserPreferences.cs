@@ -14,12 +14,19 @@ public sealed class UserPreferences
     public Dictionary<string, string> Aliases { get; init; } = new(StringComparer.Ordinal);
     public List<SavedProfile> Profiles { get; init; } = new();
     public string? Gpu { get; set; }
+    public string? GpuInstance { get; set; }
+    public string? GpuName { get; set; }
     public Appearance Theme { get; set; } = Appearance.System;
     public bool StartMinimized { get; set; }
     public bool WelcomeDismissed { get; set; }
     public CardSetting[] Cards { get; set; } = DesktopLayout.DefaultCards();
+    public OverviewDetail OverviewDetails { get; set; } = OverviewDetail.Default;
+    public OverviewChart OverviewCharts { get; set; } = OverviewChart.Default;
+    public SensorReference? OverviewFan { get; set; }
     public TrayMetric[] Tooltip { get; set; } = DesktopLayout.DefaultTooltip();
+    public TrayMetric[] CompactMetrics { get; set; } = DesktopLayout.DefaultCompactMetrics();
     public HistoryRetention Retention { get; set; }
+    public SensorReference[]? HistorySensors { get; set; }
     public ThresholdRule[] Rules { get; set; } = [];
     public FrameOverlayOptions Overlay { get; set; } = new();
     static readonly string DefaultPath = Path.Combine(AtomicJson.Folder, "monitor-preferences-v1.json");
@@ -70,8 +77,14 @@ public sealed class UserPreferences
                 .ToList().ForEach(key => saved.Aliases.Remove(key));
             saved.Theme = Enum.IsDefined(saved.Theme) ? saved.Theme : Appearance.System;
             saved.Cards = DesktopLayout.NormalizeCards(saved.Cards);
+            saved.OverviewDetails &= OverviewDetail.All;
+            saved.OverviewCharts &= OverviewChart.All;
+            if (saved.OverviewFan is not { Id.Length: > 0, DeviceId.Length: > 0, DeviceName.Length: > 0 }) saved.OverviewFan = null;
             saved.Tooltip = (saved.Tooltip ?? DesktopLayout.DefaultTooltip()).Where(value => Enum.IsDefined(value)).Distinct().ToArray();
+            saved.CompactMetrics = (saved.CompactMetrics ?? DesktopLayout.DefaultCompactMetrics()).Where(value => Enum.IsDefined(value)).Distinct().ToArray();
             saved.Retention = Enum.IsDefined(saved.Retention) ? saved.Retention : HistoryRetention.Off;
+            saved.HistorySensors = saved.HistorySensors?.Where(sensor => sensor is { Id.Length: > 0, DeviceId.Length: > 0, DeviceName.Length: > 0 })
+                .Distinct().ToArray();
             saved.Rules = (saved.Rules ?? []).Where(rule => rule?.Valid == true).DistinctBy(rule => rule.Id).Take(32).ToArray();
             saved.Overlay = (saved.Overlay ?? new()).Normalize();
             saved.Profiles.RemoveAll(entry => entry?.Channel == null || entry.Current == null || !Curve.Valid(entry.Current));
@@ -141,4 +154,37 @@ public sealed class UserPreferences
 
     public void Reset() => AtomicJson.Write(path, new UserPreferences { SchemaVersion = CurrentSchema }, backup: true);
     public string Label(string key, string original) => Aliases.TryGetValue(key, out string? alias) && !string.IsNullOrWhiteSpace(alias) ? alias : original;
+
+    internal static string DeviceAliasKey(string id, string? instanceId) => instanceId == null ? id : Telemetry.GpuInstancePrefix + instanceId;
+
+    public string DeviceLabel(string id, string original, string? instanceId = null) =>
+        Label(DeviceAliasKey(id, instanceId), Label(id, original));
+
+    public DeviceReadings? SelectedGpu(Telemetry telemetry) => telemetry.PrimaryGpu(Gpu, GpuInstance, GpuName);
+
+    public void SelectGpu(DeviceReadings? device)
+    {
+        var previous = (Gpu, GpuInstance, GpuName);
+        (Gpu, GpuInstance, GpuName) = (device?.Id, device?.InstanceId, device?.Name);
+        if (previous == (Gpu, GpuInstance, GpuName)) return;
+        try { Save(); }
+        catch { (Gpu, GpuInstance, GpuName) = previous; throw; }
+    }
+
+    public void SetAlias(string key, string name, string? legacyKey = null)
+    {
+        name = name.Trim();
+        if (name.Length > 60) throw new ArgumentException("Название должно быть не длиннее 60 символов.", nameof(name));
+        string[] keys = legacyKey == null || key == legacyKey ? [key] : [key, legacyKey];
+        var previous = keys.Where(Aliases.ContainsKey).ToDictionary(value => value, value => Aliases[value]);
+        foreach (string value in keys) Aliases.Remove(value);
+        if (name.Length > 0) Aliases[key] = name;
+        try { Save(); }
+        catch
+        {
+            Aliases.Remove(key);
+            foreach (var entry in previous) Aliases[entry.Key] = entry.Value;
+            throw;
+        }
+    }
 }

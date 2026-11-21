@@ -11,7 +11,6 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
-using System.Windows.Shapes;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using Forms = System.Windows.Forms;
@@ -21,18 +20,17 @@ namespace AirDesk;
 public sealed partial class Dashboard : Window
 {
     const int OverviewTab = 0, CoolingTab = 1, DevicesTab = 2, DiagnosticsTab = 3, SettingsTab = 4, HistoryTab = 5;
-    readonly DashboardViewModel viewModel;
+    readonly MonitoringSession viewModel;
+    readonly DisplayMetric cpuMetric = new(), gpuMetric = new(), memoryMetric = new(), storageMetric = new();
     readonly UserPreferences preferences;
     readonly bool autostartSession;
-    readonly DriverStatus startupDriver = DriverStatus.Read();
+    readonly DriverStatus startupDriver;
     readonly TabControl tabs = new() { BorderThickness = new(0) };
     readonly TextBlock status = Text("Подключение к датчикам…", 13), statusHeading = Text("Мониторинг", 15),
         statusTime = Text("", 12), setupEquipment = Text("Оборудование опрашивается…", 13), activeSummary = Text("Управление BIOS/EC", 14);
+    readonly StackPanel systemDetails = new() { Visibility = Visibility.Collapsed };
     readonly TextBlock cpuValue = Text("—", 32), ramValue = Text("—", 32), gpuValue = Text("—", 32), diskValue = Text("—", 32);
     readonly TextBlock cpuSub = Text("Процессор", 12), ramSub = Text("Память", 12), gpuSub = Text("Видеокарта", 12), diskSub = Text("Накопители", 12);
-    readonly Queue<(DateTimeOffset Time, double? Value)> history = new();
-    readonly System.Windows.Shapes.Path graph = new() { StrokeThickness = 2 };
-    readonly Canvas graphCanvas = new() { Margin = new(16, 24, 16, 10), ClipToBounds = true };
     readonly DispatcherTimer refresh = new() { Interval = TimeSpan.FromMilliseconds(250) };
     readonly UniformGrid overviewCards = new() { Columns = 4, Margin = new(0, 0, 0, 14) };
     readonly Dictionary<OverviewCard, Border> cards = new();
@@ -42,17 +40,18 @@ public sealed partial class Dashboard : Window
     Telemetry? renderedTelemetry;
     bool renderedStale;
     bool quitting, warnedStalled, shellDisposed;
+    bool compactLayout;
     bool? warningColor;
     public bool StartMinimized => preferences.StartMinimized;
 
-    public Dashboard(bool autostart, bool benchmark = false, bool recordHistory = false, bool monitorOnly = false)
+    internal Dashboard(MonitoringSession session, DriverStatus startupDriver, bool autostart, bool benchmark, bool recordHistory)
     {
+        viewModel = session;
+        this.startupDriver = startupDriver;
         autostartSession = autostart;
         preferences = UserPreferences.Load(benchmark ? System.IO.Path.Combine(AppContext.BaseDirectory, "ui-test-preferences.json") : null);
-        viewModel = new DashboardViewModel(autostart || monitorOnly,
-            benchmark ? System.IO.Path.Combine(AppContext.BaseDirectory, "benchmark-history") : null);
-        DataContext = viewModel;
-        viewModel.ConfigureHistory(benchmark ? recordHistory ? HistoryRetention.Hour : HistoryRetention.Off : preferences.Retention);
+        viewModel.ConfigureHistory(benchmark ? recordHistory ? HistoryRetention.Hour : HistoryRetention.Off : preferences.Retention,
+            benchmark ? null : preferences.HistorySensors);
         if (!benchmark) viewModel.ConfigureRules(preferences.Rules);
         AppTheme.Apply(preferences.Theme);
         Title = "AirDesk";
@@ -73,14 +72,23 @@ public sealed partial class Dashboard : Window
 
         var health = new StackPanel();
         var healthHeader = new DockPanel();
-        var inspect = Button("Подробности", () => statusTime.Visibility = statusTime.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible);
+        var inspect = Button("Подробности", () =>
+        {
+            systemDetails.Visibility = systemDetails.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
+            status.Visibility = compactLayout && systemDetails.Visibility == Visibility.Collapsed ? Visibility.Collapsed : Visibility.Visible;
+        });
         inspect.Margin = new Thickness(8, 0, 0, 0); DockPanel.SetDock(inspect, Dock.Right); healthHeader.Children.Add(inspect);
         statusHeading.VerticalAlignment = VerticalAlignment.Center; statusHeading.TextWrapping = TextWrapping.Wrap;
         AutomationProperties.SetLiveSetting(statusHeading, AutomationLiveSetting.Polite);
         healthHeader.Children.Add(statusHeading);
         health.Children.Add(healthHeader); health.Children.Add(status);
         status.TextWrapping = TextWrapping.Wrap;
-        statusTime.TextWrapping = TextWrapping.Wrap; statusTime.Visibility = Visibility.Collapsed; health.Children.Add(statusTime);
+        statusTime.TextWrapping = TextWrapping.Wrap;
+        systemDetails.Children.Add(statusTime);
+        var diagnostics = Button("Открыть диагностику", () => Navigate(DiagnosticsTab));
+        diagnostics.HorizontalAlignment = HorizontalAlignment.Left;
+        systemDetails.Children.Add(diagnostics);
+        health.Children.Add(systemDetails);
         var healthPanel = Surface(health, new Thickness(12, 7, 12, 7), new Thickness(0, 8, 0, 0));
         DockPanel.SetDock(healthPanel, Dock.Bottom); root.Children.Add(healthPanel);
 
@@ -92,6 +100,17 @@ public sealed partial class Dashboard : Window
         tabs.Items.Add(new TabItem { Header = "_Диагностика", Content = BuildDiagnostics() });
         tabs.Items.Add(new TabItem { Header = "_Настройки", Content = Scroll(BuildSettings()) });
         tabs.Items.Add(new TabItem { Header = "_История", Content = Scroll(BuildHistory()) });
+        SizeChanged += (_, size) =>
+        {
+            bool compact = size.NewSize.Width < 510 || size.NewSize.Height < 500;
+            if (compact == compactLayout) return;
+            compactLayout = compact;
+            root.Margin = new(compact ? 10 : 18);
+            name.FontSize = compact ? 23 : 28;
+            hide.Content = compact ? "В трей" : "Свернуть в трей";
+            status.Visibility = compact && systemDetails.Visibility == Visibility.Collapsed ? Visibility.Collapsed : Visibility.Visible;
+            foreach (var value in new[] { cpuValue, gpuValue, ramValue, diskValue }) value.FontSize = compact ? 25 : 32;
+        };
         PreviewKeyDown += (_, e) =>
         {
             if (Keyboard.Modifiers != ModifierKeys.Control || e.Key < Key.D1 || e.Key > Key.D6) return;
@@ -121,29 +140,34 @@ public sealed partial class Dashboard : Window
         welcome.Visibility = preferences.WelcomeDismissed ? Visibility.Collapsed : Visibility.Visible;
         body.Children.Add(welcome);
 
-        cards[OverviewCard.Cpu] = Card("Процессор", cpuValue, cpuSub);
-        cards[OverviewCard.Gpu] = Card("Видеокарта", gpuValue, gpuSub);
-        cards[OverviewCard.Memory] = Card("Память", ramValue, ramSub);
-        cards[OverviewCard.Storage] = Card("Накопители", diskValue, diskSub);
-        BindMetric(cpuValue, cpuSub, viewModel.Cpu); BindMetric(gpuValue, gpuSub, viewModel.Gpu);
-        BindMetric(ramValue, ramSub, viewModel.Memory); BindMetric(diskValue, diskSub, viewModel.Storage);
+        var heading = new DockPanel { Margin = new(0, 0, 8, 4) };
+        var choose = Button("Показатели…", () =>
+        {
+            Navigate(SettingsTab);
+            Dispatcher.BeginInvoke(() => monitorSettingsHeading.BringIntoView(), DispatcherPriority.Loaded);
+        });
+        choose.Margin = new(0, 0, 0, 6);
+        DockPanel.SetDock(choose, Dock.Right);
+        heading.Children.Add(choose);
+        heading.Children.Add(Text("Мониторинг", 19));
+        body.Children.Add(heading);
+
+        cards[OverviewCard.Cpu] = MonitorCard(OverviewCard.Cpu, cpuValue, cpuSub, "Загрузка");
+        cards[OverviewCard.Gpu] = MonitorCard(OverviewCard.Gpu, gpuValue, gpuSub, "Загрузка");
+        cards[OverviewCard.Memory] = MonitorCard(OverviewCard.Memory, ramValue, ramSub, "Занято");
+        cards[OverviewCard.Storage] = MonitorCard(OverviewCard.Storage, diskValue, diskSub, "Макс. активность");
+        BindMetric(cpuValue, cpuSub, cpuMetric); BindMetric(gpuValue, gpuSub, gpuMetric);
+        BindMetric(ramValue, ramSub, memoryMetric); BindMetric(diskValue, diskSub, storageMetric);
         ReorderCards();
         overviewCards.SizeChanged += (_, e) => overviewCards.Columns = DesktopLayout.Columns(e.NewSize.Width);
         body.Children.Add(overviewCards);
+        body.Children.Add(BuildLiveGraphs());
 
         var cooling = new StackPanel();
         cooling.Children.Add(Text("Охлаждение", 17));
         activeSummary.TextWrapping = TextWrapping.Wrap; cooling.Children.Add(activeSummary);
         cooling.Children.Add(Button("Открыть охлаждение", () => Navigate(CoolingTab)));
         body.Children.Add(Surface(cooling, new Thickness(14), new Thickness(0, 0, 0, 10)));
-
-        var chart = new Grid { Height = 76, Margin = new(0, 0, 0, 4) };
-        var chartLabel = Text("Загрузка процессора за 60 секунд", 12); chartLabel.Margin = new(16, 8, 0, 0);
-        chart.Children.Add(chartLabel);
-        graph.SetResourceReference(Shape.StrokeProperty, AppTheme.Accent);
-        graphCanvas.Children.Add(graph); chart.Children.Add(graphCanvas);
-        graphCanvas.SizeChanged += (_, _) => DrawGraph();
-        body.Children.Add(Surface(chart, new Thickness(0), new Thickness(0, 0, 0, 14)));
 
         return body;
     }
@@ -186,6 +210,7 @@ public sealed partial class Dashboard : Window
                 System.IO.File.WriteAllText(System.IO.Path.Combine(AppContext.BaseDirectory, benchmark ? "benchmark.json" : "smoke.json"), ReportText());
                 if (uiSmoke) await CaptureInterfaceAsync();
             }
+            catch (Exception error) { Monitor.Log(error); throw; }
             finally { await ExitAsync(); }
         };
         timer.Start();
@@ -194,17 +219,20 @@ public sealed partial class Dashboard : Window
     void Render()
     {
         latest = viewModel.Latest;
-        RenderFrames();
         if (latest == null)
         {
-            if (viewModel.Stalled)
+            RenderFrames();
+            if (viewModel.Failure != null || viewModel.Stalled)
             {
                 statusHeading.Text = "Сбой датчиков";
-                status.Text = "Оборудование не отвечает. Откройте диагностику и проверьте доступ к драйверу.";
+                statusHeading.SetResourceReference(TextBlock.ForegroundProperty, AppTheme.Warning);
+                warningColor = true;
+                status.Text = viewModel.Failure ?? "Оборудование не отвечает. Откройте диагностику и проверьте доступ к драйверу.";
+                if (diagnosticTable.IsVisible) RefreshDiagnostics();
             }
             return;
         }
-        bool stale = viewModel.Stalled || DateTimeOffset.Now - latest.Time >= TimeSpan.FromSeconds(4) ||
+        bool stale = viewModel.Failure != null || viewModel.Stalled || DateTimeOffset.Now - latest.Time >= TimeSpan.FromSeconds(4) ||
             DateTimeOffset.TryParse(latest.Cooling.LastPollUtc, out var polled) && DateTimeOffset.Now - polled >= TimeSpan.FromSeconds(4);
         if (stale && !warnedStalled && (latest.Cooling.CanRelease || latest.Cooling.State is ChannelState.Controlled or ChannelState.Restoring))
         {
@@ -215,14 +243,16 @@ public sealed partial class Dashboard : Window
         if (!stale) warnedStalled = false;
         displayed = latest.Telemetry;
         previousStale = stale;
+        RenderFrames();
         if (IsVisible && (!ReferenceEquals(renderedTelemetry, displayed) || stale != renderedStale))
         {
-            bool newData = !ReferenceEquals(renderedTelemetry, displayed);
             renderedTelemetry = displayed;
             renderedStale = stale;
-            RenderTelemetry(displayed, stale, newData);
-            setupEquipment.Text = $"Найдено: {string.Join(", ", displayed.Devices.Where(device => device.Type != "Memory").Select(device => device.Name).Distinct().Take(6))}.\n{startupDriver.Description}";
+            RenderTelemetry(displayed, stale);
+            setupEquipment.Text = displayed.Devices.Length == 0 ? "Ожидание показаний оборудования…" :
+                $"{displayed.Devices.Length} устройств · {displayed.Readings.Count(reading => reading.Available)} датчиков с показаниями.\n{startupDriver.Description}";
         }
+        RenderLiveGraphs(latest, stale);
         RenderSystem(latest, stale);
         if (IsVisible) RenderCooling(latest.Cooling, stale);
         RenderTray(latest.Telemetry, latest.Cooling, stale);
@@ -242,9 +272,12 @@ public sealed partial class Dashboard : Window
         string heading = state switch
         {
             ChannelState.Conflict => "Конфликт управления",
-            ChannelState.Restoring => "Возврат управления",
+            ChannelState.Restoring => "Возврат BIOS/EC",
+            ChannelState.Error when snapshot.Cooling.NeedsRecovery => "Нужно проверить охлаждение",
             ChannelState.Error => "Ошибка управления",
-            _ when stale || snapshot.PollIssue != null => "Сбой датчиков",
+            _ when viewModel.Failure != null => "Опрос остановлен",
+            _ when stale => "Опрос не отвечает",
+            _ when snapshot.PollIssue != null => "Часть датчиков недоступна",
             ChannelState.Controlled => "Управление активно",
             ChannelState.Unverified or ChannelState.Unavailable => "Требуется настройка",
             _ => "Мониторинг"
@@ -261,9 +294,11 @@ public sealed partial class Dashboard : Window
             warningColor = warning;
         }
         status.Text = state is ChannelState.Conflict or ChannelState.Restoring or ChannelState.Error ? FriendlyStatus(snapshot.Cooling) :
-            stale ? "Показания устарели. Откройте диагностику, чтобы проверить драйвер." :
-            snapshot.PollIssue != null ? "Часть показаний недоступна. Сведения об ошибке есть в диагностике." :
+            viewModel.Failure is { } failure ? failure :
+            stale ? "Свежих показаний нет. Проверьте время опроса и состояние драйвера в диагностике." :
+            snapshot.PollIssue != null ? "Доступные показатели продолжают обновляться. Откройте диагностику, чтобы найти проблемный датчик." :
             autostartSession && state == ChannelState.MonitorOnly ? "Автозапуск работает в режиме мониторинга. Для настройки охлаждения откройте AirDesk вручную." : FriendlyStatus(snapshot.Cooling);
+        statusHeading.ToolTip = status.Text;
         string lastPoll = DateTimeOffset.TryParse(snapshot.Cooling.LastPollUtc, out var time) ? time.ToLocalTime().ToString("HH:mm:ss") : "—";
         statusTime.Text = $"Последний опрос: {lastPoll}\n{snapshot.Cooling.Reason}" +
             (snapshot.PollIssue is { } issue ? $"\n{issue}" : "");
@@ -278,29 +313,9 @@ public sealed partial class Dashboard : Window
         ChannelState.MonitorOnly => "Доступно наблюдение. Причину ограничения можно посмотреть в диагностике.",
         ChannelState.Verified => "Группа проверена. Наблюдение работает, управление включается вручную.",
         ChannelState.Error when cooling.NeedsRecovery => "Проверьте охлаждение в BIOS/EC и подтвердите восстановление на вкладке «Охлаждение».",
-        ChannelState.Error => "Управление остановлено. Причина и результат возврата доступны в подробностях.",
+        ChannelState.Error => "AirDesk остановил регулирование. На вкладке «Охлаждение» указан результат возврата BIOS/EC.",
         _ => cooling.Reason
     };
-
-    void DrawGraph()
-    {
-        DateTimeOffset left = DateTimeOffset.Now.AddSeconds(-60);
-        var shape = new StreamGeometry();
-        using (var line = shape.Open())
-        {
-            DateTimeOffset? last = null;
-            foreach (var item in history)
-            {
-                if (item.Time < left || item.Value == null) { last = null; continue; }
-                var point = new Point((item.Time - left).TotalSeconds * graphCanvas.ActualWidth / 60,
-                    graphCanvas.ActualHeight * (1 - Math.Clamp(item.Value.Value, 0, 100) / 100));
-                if (last == null || item.Time - last > TimeSpan.FromSeconds(2.5)) line.BeginFigure(point, false, false);
-                else line.LineTo(point, true, false);
-                last = item.Time;
-            }
-        }
-        shape.Freeze(); graph.Data = shape;
-    }
 
     void Navigate(int index) => tabs.SelectedIndex = index;
     void ShowMain() { flyout?.Hide(); Show(); WindowState = WindowState.Normal; Activate(); Render(); }
@@ -374,13 +389,5 @@ public sealed partial class Dashboard : Window
         border.SetResourceReference(Border.BackgroundProperty, AppTheme.Surface);
         border.SetResourceReference(Border.BorderBrushProperty, AppTheme.Edge);
         return border;
-    }
-    static Border Card(string title, TextBlock value, TextBlock sub)
-    {
-        var content = new StackPanel(); content.Children.Add(Text(title, 13));
-        value.SetResourceReference(TextBlock.ForegroundProperty, AppTheme.Accent);
-        value.FontWeight = FontWeights.SemiBold;
-        content.Children.Add(value); sub.TextWrapping = TextWrapping.Wrap; content.Children.Add(sub);
-        return Surface(content, new Thickness(14), new Thickness(0, 0, 8, 8));
     }
 }

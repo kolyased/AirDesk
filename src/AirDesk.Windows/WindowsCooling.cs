@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -17,15 +18,24 @@ internal static class ControllerProcesses
     {
         try
         {
-            string[] names = Process.GetProcesses().Select(process =>
+            Process[] processes = Process.GetProcesses();
+            try
             {
-                using (process)
+                HashSet<string>? names = null;
+                foreach (Process process in processes)
                 {
-                    try { return ControllerNames.Match(process.ProcessName); }
-                    catch (InvalidOperationException) { return null; } // Process exited during enumeration.
+                    string? name;
+                    try { name = ControllerNames.Match(process.ProcessName); }
+                    catch (InvalidOperationException) { continue; } // Process exited during enumeration.
+                    if (name != null) (names ??= new(StringComparer.Ordinal)).Add(name);
                 }
-            }).OfType<string>().Distinct().Order().ToArray();
-            return names.Length == 0 ? null : $"Управление недоступно: обнаружен {string.Join(", ", names)}. Завершите его, включая трей или службу. Захват канала этим ПО не подтверждён.";
+                return names == null ? null :
+                    $"Управление недоступно. Обнаружены процессы: {string.Join(", ", names.Order(StringComparer.Ordinal))}. Закройте приложения, включая трей и службы. Обнаружение процесса не подтверждает захват канала.";
+            }
+            finally
+            {
+                foreach (Process process in processes) process.Dispose();
+            }
         }
         catch (Exception error)
         {
@@ -33,7 +43,6 @@ internal static class ControllerProcesses
             return "Не удалось проверить запущенные контроллеры. Управление заблокировано.";
         }
     }
-
 }
 
 internal sealed class LocalCalibration : ICalibrationStore
@@ -172,27 +181,36 @@ internal sealed class WindowsCooling : IFanController, IDisposable
     public void Acquire()
     {
         if (power?.Control == null || setControl == null) throw new InvalidOperationException("Канал записи недоступен.");
-        writer ??= new Mutex(false, @"Global\AirDesk.Cooling.Owner");
-        try { leased = writer.WaitOne(0); }
-        catch (AbandonedMutexException) { writer.ReleaseMutex(); throw new InvalidOperationException("Предыдущий владелец канала завершился аварийно."); }
-        if (!leased) throw new InvalidOperationException("Канал занят другим экземпляром AirDesk.");
-        try { original = WithBus(ReadCurrent); }
+        AcquireLease(recovery: false);
+        try { original = WithBus(ReadCurrent).State; }
         catch { ReleaseLease(); throw; }
         softwareAttempted = false;
         lastRawCommand = null;
     }
 
-    public float? Write(float percent, Action guard) => WithBus<float?>(() =>
+    public void AcquireRecoveryLease() => AcquireLease(recovery: true);
+
+    void AcquireLease(bool recovery)
+    {
+        if (leased) throw new InvalidOperationException("Этот сеанс уже владеет каналом охлаждения.");
+        writer ??= new Mutex(false, @"Global\AirDesk.Cooling.Owner");
+        try { leased = writer.WaitOne(0); }
+        catch (AbandonedMutexException) when (recovery) { leased = true; }
+        catch (AbandonedMutexException) { writer.ReleaseMutex(); throw new InvalidOperationException("Предыдущий владелец канала завершился аварийно."); }
+        if (!leased) throw new InvalidOperationException("Канал занят другим экземпляром AirDesk.");
+    }
+
+    public float? Write(float percent, Action<float?> guard) => WithBus<float?>(() =>
     {
         var before = ReadCurrent();
-        if (lastRawCommand is byte last ? before != (0, last) : before != original)
+        if (lastRawCommand is byte last ? before.State != (0, last) : before.State != original)
             throw new InvalidOperationException("Режим или команда выхода изменились вне AirDesk. Источник изменения неизвестен.");
-        guard();
+        guard(before.Output * 100f / 255);
         byte command = (byte)Math.Ceiling(percent * 255d / 100d);
         softwareAttempted = true;
         setControl!(1, command);
         var readback = ReadCurrent();
-        if (readback != (0, command)) return null;
+        if (readback.State != (0, command)) return null;
         lastRawCommand = command;
         return command * 100f / 255;
     });
@@ -203,34 +221,41 @@ internal sealed class WindowsCooling : IFanController, IDisposable
         // Recheck the same backend and readable register map before asking it to restore.
         _ = ReadCurrent();
         setControl!(1, null);
-        bool verified = ReadCurrent() == original;
+        bool verified = ReadCurrent().State == original;
         if (verified) softwareAttempted = false;
         return new(verified, verified, verified ? "Режим и команда контроллера совпали с исходными." : "Исходный режим или команда не подтверждены." );
     });
 
-    (byte Mode, byte Command) ReadCurrent()
+    ((byte Mode, byte Command) State, byte? Output) ReadCurrent()
     {
         var registers = ReadRegisters();
         if (Identity?.Chip != ChipId + " " + registers.Fingerprint)
             throw new InvalidOperationException("Изменилась аппаратная идентичность Super I/O.");
-        return (registers.Mode, registers.Command);
+        return (registers.State, registers.Output);
     }
 
-    (byte Mode, byte Command, string Fingerprint) ReadRegisters()
+    ((byte Mode, byte Command) State, byte? Output, string Fingerprint) ReadRegisters()
     {
         // Public report of the pinned 0.9.6 NCT6779D backend.
         string report = chip!.GetReport();
         if (!report.Contains("Chip Id: 0xC560", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Не подтверждена аппаратная идентичность NCT6779D.");
-        string[]? row = report.Split('\n').Select(line => line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
-            .SingleOrDefault(fields => fields.Length == 17 && fields[0] == "0200");
-        if (row == null || !byte.TryParse(row[3], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out byte mode) ||
-            !byte.TryParse(row[10], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out byte command))
+        var lines = report.Split('\n');
+        var rows = lines.Select(line => line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+            .Where(fields => fields.Length == 17).ToArray();
+        var configured = rows.SingleOrDefault(fields => fields[0] == "0200");
+        var measured = rows.SingleOrDefault(fields => fields[0] == "0000");
+        // Channel 1 uses 0x202 for mode, 0x209 for command and 0x003 for live output.
+        if (configured == null ||
+            !byte.TryParse(configured[3], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out byte mode) ||
+            !byte.TryParse(configured[10], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out byte command))
             throw new InvalidOperationException("Не читаются регистры текущего режима и команды выхода.");
-        string? chipRevision = report.Split('\n').SingleOrDefault(line => line.StartsWith("Chip Revision: 0x", StringComparison.Ordinal))?.Trim();
-        string? baseAddress = report.Split('\n').SingleOrDefault(line => line.StartsWith("Base Address: 0x", StringComparison.Ordinal))?.Trim();
+        byte? output = measured != null && byte.TryParse(measured[4], NumberStyles.HexNumber, CultureInfo.InvariantCulture,
+            out byte duty) ? duty : null;
+        string? chipRevision = lines.SingleOrDefault(line => line.StartsWith("Chip Revision: 0x", StringComparison.Ordinal))?.Trim();
+        string? baseAddress = lines.SingleOrDefault(line => line.StartsWith("Base Address: 0x", StringComparison.Ordinal))?.Trim();
         if (chipRevision == null || baseAddress == null) throw new InvalidOperationException("Нет ревизии или адреса Super I/O.");
-        return (mode, command, chipRevision + " " + baseAddress);
+        return ((mode, command), output, chipRevision + " " + baseAddress);
     }
 
     T WithBus<T>(Func<T> action)

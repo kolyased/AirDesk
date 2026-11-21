@@ -10,6 +10,7 @@ public record Reading(string Device, string DeviceId, string DeviceType, string 
     float? Value, string Id, ReadingQuality Quality, DateTimeOffset? UpdatedAt)
 {
     public string Source => "LibreHardwareMonitor";
+    public string? DeviceInstance { get; init; }
     public bool Available => Quality == ReadingQuality.Fresh && Value.HasValue;
     public SensorReference Reference => new(Id, DeviceId, Device);
 
@@ -46,16 +47,18 @@ public sealed class DeviceReadings
     public string Id { get; }
     public string Name { get; }
     public string Type { get; }
+    public string? InstanceId { get; }
     public Reading[] Readings { get; }
     public bool Gpu => Type is "GpuNvidia" or "GpuAmd" or "GpuIntel";
     public bool Disk => Type == "Storage";
 
-    public DeviceReadings(IGrouping<string, Reading> readings)
+    public DeviceReadings(IGrouping<string, Reading> readings, string? instanceId = null)
     {
         Id = readings.Key;
         Readings = readings.OrderBy(reading => reading.Id, StringComparer.Ordinal).ToArray();
         Name = Readings[0].Device;
         Type = Readings[0].DeviceType;
+        InstanceId = instanceId;
         byKey = Readings.Where(reading => reading.Id.StartsWith(Id + "/", StringComparison.Ordinal))
             .GroupBy(reading => reading.Id[Id.Length..]).Where(group => group.Count() == 1)
             .ToDictionary(group => group.Key, group => group.Single());
@@ -92,44 +95,57 @@ public sealed class DeviceReadings
     public Metric[] Details()
     {
         var items = new List<Metric>();
-        if (Temperature != null || Gpu || Disk || Type == "Cpu") items.Add(new("Температура", Temperature, Missing: ReadingQuality.NoSensor));
-        if (Load != null || Gpu || Disk || Type is "Cpu" or "Memory") items.Add(new("Нагрузка / активность", Load));
+        if (Temperature != null || Gpu || Disk || Type == "Cpu")
+            items.Add(new(Gpu ? "Температура ядра" : "Температура", Temperature, Section: "Температуры", Missing: ReadingQuality.NoSensor));
+        if (Gpu) items.Add(new("Горячая точка", Hotspot, Section: "Температуры", Missing: ReadingQuality.NoSensor));
+        if (Load != null || Gpu || Disk || Type is "Cpu" or "Memory")
+            items.Add(new(Disk ? "Активность" : "Загрузка", Load, Section: "Нагрузка"));
         if (Gpu)
         {
-            items.Add(new("Горячая точка", Hotspot, Missing: ReadingQuality.NoSensor));
-            items.Add(new("VRAM занято", MemoryUsed));
-            items.Add(new("VRAM всего", VramTotal));
+            items.Add(new("Занято", MemoryUsed, Section: "Видеопамять (VRAM)"));
+            items.Add(new("Всего", VramTotal, Section: "Видеопамять (VRAM)"));
         }
         if (Id == "/ram")
         {
-            items.Add(new("Используется", MemoryUsed));
-            items.Add(new("Всего", null, MemoryTotal, "ГБ"));
+            var used = MemoryUsed;
+            var free = Get("/data/1");
+            var failure = used is { Available: false } ? used : free;
+            items.Add(new("Используется", used, Section: "Объём памяти"));
+            items.Add(new("Всего", null, MemoryTotal, "ГБ", "Объём памяти",
+                failure is { Available: false } ? failure.Quality : ReadingQuality.Unsupported));
         }
         if (Type is "Cpu" or "Memory" || Gpu)
         {
-            items.AddRange(Readings.Where(r => r.Kind == "Clock" || r.Kind == "Power" || Type == "Memory" && r.Kind == "Temperature")
-                .Select(r => new Metric(r.Name, r)));
-            if (!Readings.Any(r => r.Kind == "Clock")) items.Add(new("Частота", null));
-            if ((Gpu || Type == "Cpu") && !Readings.Any(r => r.Kind == "Power")) items.Add(new("Потребление", null));
-            if (Type == "Memory" && !Readings.Any(r => r.Kind == "Temperature")) items.Add(new("Температура памяти", null, Missing: ReadingQuality.NoSensor));
+            AddKind("Clock", "Частоты", "Частота");
+            if (Gpu || Type == "Cpu" || Readings.Any(r => r.Kind == "Power")) AddKind("Power", "Мощность", "Потребление");
+            if (Type == "Memory") AddKind("Temperature", "Температуры", "Температура памяти", ReadingQuality.NoSensor);
         }
         if (Disk)
         {
-            items.Add(new("Чтение", Named("Throughput", "Read Rate", "Read Speed")));
-            items.Add(new("Запись", Named("Throughput", "Write Rate", "Write Speed")));
-            items.Add(new("Оставшийся ресурс SMART", SmartPercent("Life", "Remaining Life", "SSD Life Left")));
+            items.Add(new("Чтение", Named("Throughput", "Read Rate", "Read Speed"), Section: "Передача данных"));
+            items.Add(new("Запись", Named("Throughput", "Write Rate", "Write Speed"), Section: "Передача данных"));
+            items.AddRange(Readings.Where(r => r.Kind == "Data" && (r.Name == "Data Read" || r.Name == "Data Written"))
+                .Select(r => new Metric(r.Name, r, Section: "Передача данных")));
+            items.Add(new("Оставшийся ресурс SMART", SmartPercent("Life", "Remaining Life", "SSD Life Left"), Section: "Ресурс накопителя"));
             if (Id.StartsWith("/nvme/", StringComparison.Ordinal))
             {
-                items.Add(new("Использованный ресурс NVMe", SmartPercent("Percentage Used", allowAbove100: true)));
-                items.Add(new("Доступный резерв NVMe", SmartPercent("Available Spare")));
-                items.Add(new("Порог резерва NVMe", SmartPercent("Available Spare Threshold")));
+                items.Add(new("Использованный ресурс NVMe", SmartPercent("Percentage Used", allowAbove100: true), Section: "Ресурс накопителя"));
+                items.Add(new("Доступный резерв NVMe", SmartPercent("Available Spare"), Section: "Ресурс накопителя"));
+                items.Add(new("Порог резерва NVMe", SmartPercent("Available Spare Threshold"), Section: "Ресурс накопителя"));
             }
-            items.AddRange(Readings.Where(r => r.Kind == "Data" && (r.Name == "Data Read" || r.Name == "Data Written")).Select(r => new Metric(r.Name, r)));
         }
         if (Type is "Motherboard" or "SuperIO")
             items.AddRange(Readings.Where(r => r.Kind is "Voltage" or "Temperature" or "Fan" or "Control")
                 .Select(r => new Metric(r.Name, r, Section: BoardSection(r))).OrderBy(metric => metric.Section, StringComparer.CurrentCulture));
+        if (items.Count == 0) items.AddRange(Readings.Select(r => new Metric(r.Name, r, Section: "Показания")));
         return items.ToArray();
+
+        void AddKind(string kind, string section, string placeholder, ReadingQuality missing = ReadingQuality.Unsupported)
+        {
+            int previous = items.Count;
+            items.AddRange(Readings.Where(r => r.Kind == kind).Select(r => new Metric(r.Name, r, Section: section)));
+            if (items.Count == previous) items.Add(new(placeholder, null, Section: section, Missing: missing));
+        }
     }
 
     Reading? SmartPercent(params string[] labels) => SmartPercent(false, labels);
@@ -156,7 +172,9 @@ public sealed class DeviceReadings
 
 public sealed class Telemetry
 {
+    internal const string GpuInstancePrefix = "gpu-instance:";
     readonly Dictionary<SensorReference, Reading> bySensor;
+    readonly Dictionary<string, string> instances;
     public static readonly Telemetry Empty = new([]);
     public Reading[] Readings { get; }
     public DeviceReadings[] Devices { get; }
@@ -166,8 +184,14 @@ public sealed class Telemetry
     public DeviceReadings[] Disks { get; }
     public TemperatureInput[] CurveSources { get; }
     public Reading[] HistorySources { get; }
+    public IEnumerable<Reading> HistoryCandidates => Readings.Where(reading => reading.Kind is "Temperature" or "Load" or "Fan" &&
+        bySensor.ContainsKey(reading.Reference));
     public Reading? Find(SensorReference sensor) => bySensor.GetValueOrDefault(sensor);
-    public DeviceReadings? PrimaryGpu(string? id) => Gpus.FirstOrDefault(device => device.Id == id) ?? Gpus.FirstOrDefault();
+    internal SensorReference PersistentReference(Reading reading) => InstanceReference(reading, instances.GetValueOrDefault(reading.DeviceId)) ?? reading.Reference;
+    public DeviceReadings? PrimaryGpu(string? id, string? instanceId = null, string? originalName = null) => instanceId != null
+        ? Gpus.SingleOrDefault(device => device.InstanceId == instanceId)
+        : id == null ? Gpus.FirstOrDefault() : Gpus.FirstOrDefault(device => device.Id == id &&
+            (originalName == null || device.Name == originalName));
 
     public static TimeSpan MaxAge(string deviceType) => deviceType switch
     {
@@ -178,22 +202,48 @@ public sealed class Telemetry
     {
         Readings = readings;
         bySensor = readings.GroupBy(r => r.Reference).Where(group => group.Count() == 1).ToDictionary(group => group.Key, group => group.Single());
+        var adapterIds = readings.Where(reading => reading.DeviceInstance != null)
+            .Select(reading => (reading.DeviceId, Instance: reading.DeviceInstance!)).Distinct().ToArray();
+        instances = adapterIds.GroupBy(pair => pair.Instance, StringComparer.Ordinal).Where(group => group.Count() == 1)
+            .Select(group => group.Single()).GroupBy(pair => pair.DeviceId, StringComparer.Ordinal).Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single().Instance, StringComparer.Ordinal);
         Devices = readings.GroupBy(reading => reading.DeviceId).OrderBy(group => group.Key, StringComparer.Ordinal)
-            .Select(group => new DeviceReadings(group)).ToArray();
+            .Select(group => new DeviceReadings(group, instances.GetValueOrDefault(group.Key))).ToArray();
         Cpu = Devices.FirstOrDefault(device => device.Type == "Cpu");
         Ram = Devices.SingleOrDefault(device => device.Id == "/ram");
         Gpus = Devices.Where(device => device.Gpu).ToArray();
         Disks = Devices.Where(device => device.Disk).ToArray();
         HistorySources = Devices.SelectMany(device => new[] { device.Temperature, device.Load, device.Hotspot })
             .OfType<Reading>().Concat(readings.Where(reading => reading.Kind == "Fan" && reading.Value > 0 && reading.DeviceType == "SuperIO"))
-            .DistinctBy(reading => reading.Reference).ToArray();
+            .Where(reading => bySensor.ContainsKey(reading.Reference)).DistinctBy(reading => reading.Reference).ToArray();
+        var modelNames = Devices.ToLookup(device => (device.Type, device.Name.ToUpperInvariant()));
         CurveSources = Devices.Where(device => device.Type == "Cpu" || device.Gpu)
-            .Where(device => Devices.Count(other => other.Type == device.Type && other.Name == device.Name) == 1)
-            .SelectMany(device => device.Readings.Where(reading => reading.Kind == "Temperature" &&
-                (reading == device.Temperature || reading == device.Hotspot || device.Type == "Cpu" &&
-                 reading.Name is "Core Max" or "Core Average" or "CCD1 (Tdie)")))
-            .GroupBy(reading => reading.Reference).Where(group => group.Count() == 1).Select(group => group.Single())
-            .Select(reading => new TemperatureInput(reading.Reference, $"{reading.Device} · {reading.Name}",
-                reading.Available && FanPolicy.ValidTemperature(reading.Value) ? reading.Value : null)).ToArray();
+            .SelectMany(device => CurveFor(device, modelNames[(device.Type, device.Name.ToUpperInvariant())].Count() == 1))
+            .GroupBy(input => input.Source).Where(group => group.Count() == 1).Select(group => group.Single()).ToArray();
+    }
+
+    static IEnumerable<TemperatureInput> CurveFor(DeviceReadings device, bool uniqueModel)
+    {
+        if (device.Gpu ? device.InstanceId == null : !uniqueModel) yield break;
+        string name = uniqueModel ? device.Name : $"{device.Name} ({device.Id})";
+        var temperature = device.Temperature;
+        var hotspot = device.Hotspot;
+        foreach (var reading in device.Readings)
+        {
+            if (reading.Kind != "Temperature" || (reading != temperature && reading != hotspot &&
+                !(device.Type == "Cpu" && reading.Name is "Core Max" or "Core Average" or "CCD1 (Tdie)"))) continue;
+            var instance = InstanceReference(reading, device.InstanceId);
+            if (device.Gpu && instance == null) continue;
+            var source = instance ?? reading.Reference;
+            yield return new(source, $"{name} · {reading.Name}",
+                reading.Available && FanPolicy.ValidTemperature(reading.Value) ? reading.Value : null, reading.Id);
+        }
+    }
+
+    static SensorReference? InstanceReference(Reading reading, string? instanceId)
+    {
+        if (instanceId == null || !reading.Id.StartsWith(reading.DeviceId + "/", StringComparison.Ordinal)) return null;
+        string key = GpuInstancePrefix + instanceId;
+        return new(key + reading.Id[reading.DeviceId.Length..], key, reading.Device);
     }
 }

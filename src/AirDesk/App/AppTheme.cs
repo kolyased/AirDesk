@@ -8,7 +8,8 @@ namespace AirDesk;
 internal static class AppTheme
 {
     public const string Background = "AirDesk.Background", Surface = "AirDesk.Surface", Alternate = "AirDesk.Alternate",
-        Text = "AirDesk.Text", Muted = "AirDesk.Muted", Accent = "AirDesk.Accent", Warning = "AirDesk.Warning", Edge = "AirDesk.Edge";
+        Text = "AirDesk.Text", Muted = "AirDesk.Muted", Accent = "AirDesk.Accent", Warning = "AirDesk.Warning", Edge = "AirDesk.Edge",
+        ChartSecondary = "AirDesk.ChartSecondary";
 
     public static void Apply(Appearance appearance)
     {
@@ -23,7 +24,7 @@ internal static class AppTheme
         {
             resources[Background] = SystemColors.WindowBrush;
             resources[Surface] = resources[Alternate] = SystemColors.WindowBrush;
-            resources[Text] = resources[Muted] = resources[Accent] = resources[Warning] = resources[Edge] = SystemColors.WindowTextBrush;
+            resources[Text] = resources[Muted] = resources[Accent] = resources[Warning] = resources[Edge] = resources[ChartSecondary] = SystemColors.WindowTextBrush;
             return;
         }
 
@@ -33,6 +34,7 @@ internal static class AppTheme
         resources[Text] = Brush(dark ? "#F4FAFE" : "#16262B");
         resources[Muted] = Brush(dark ? "#AEBFD0" : "#445B61");
         resources[Accent] = Brush(dark ? "#75E3BF" : "#075E4D");
+        resources[ChartSecondary] = Brush(dark ? "#90BFFF" : "#234F9A");
         resources[Warning] = Brush(dark ? "#FFCF90" : "#854411");
         resources[Edge] = Brush(dark ? "#34475A" : "#C8D9D7");
     }

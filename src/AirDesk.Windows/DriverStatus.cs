@@ -26,9 +26,10 @@ internal sealed record DriverStatus(DriverRegistration Registration, string? Ver
 
     public static DriverStatus Read()
     {
-        bool elevated = IsElevated();
+        bool elevated = false;
         try
         {
+            elevated = IsElevated();
             using var service = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\PawnIO");
             if (service == null) return new(DriverRegistration.Missing, null, elevated);
             string? image = service.GetValue("ImagePath") as string;

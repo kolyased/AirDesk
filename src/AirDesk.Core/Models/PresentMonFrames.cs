@@ -7,6 +7,9 @@ namespace AirDesk;
 
 internal sealed record FrameRate(double FramesPerSecond, double MedianMilliseconds, int Samples);
 
+internal enum FrameBatchStatus { Measured, MissingPid, InvalidIntervals, InsufficientSamples }
+internal sealed record FrameBatch(FrameRate? Rate, FrameBatchStatus Status);
+
 internal sealed class PresentMonFrames
 {
     readonly int pidColumn, chainColumn, timeColumn;
@@ -23,27 +26,39 @@ internal sealed class PresentMonFrames
         int Find(string name) => Array.FindIndex(columns, value => string.Equals(value, name, StringComparison.OrdinalIgnoreCase));
     }
 
-    public FrameRate? Summarize(IEnumerable<string> lines, int processId)
+    public FrameRate? Summarize(IEnumerable<string> lines, int processId) => Analyze(lines, processId).Rate;
+
+    public FrameBatch Analyze(IEnumerable<string> lines, int processId)
     {
         var chains = new Dictionary<string, List<double>>(StringComparer.OrdinalIgnoreCase);
         int maxColumn = Math.Max(timeColumn, Math.Max(pidColumn, chainColumn));
+        bool hasTargetRows = false;
         foreach (string line in lines)
         {
             string[] fields = Split(line);
-            if (fields.Length <= maxColumn || !int.TryParse(fields[pidColumn], NumberStyles.None, CultureInfo.InvariantCulture, out int pid) ||
-                pid != processId || !double.TryParse(fields[timeColumn], NumberStyles.Float, CultureInfo.InvariantCulture, out double milliseconds) ||
-                !double.IsFinite(milliseconds) || milliseconds is <= 0 or > 5000 || fields[chainColumn].Length == 0)
+            if (fields.Length <= pidColumn ||
+                !int.TryParse(fields[pidColumn], NumberStyles.None, CultureInfo.InvariantCulture, out int pid) || pid != processId)
                 continue;
+
+            hasTargetRows = true;
+            if (fields.Length <= maxColumn || fields[chainColumn].Length == 0 ||
+                !double.TryParse(fields[timeColumn], NumberStyles.Float, CultureInfo.InvariantCulture, out double milliseconds) ||
+                !double.IsFinite(milliseconds) || milliseconds is <= 0 or > 5000 || !double.IsFinite(1000 / milliseconds))
+                continue;
+
             if (!chains.TryGetValue(fields[chainColumn], out var samples)) chains.Add(fields[chainColumn], samples = new());
             samples.Add(milliseconds);
         }
 
         var frames = chains.Values.MaxBy(values => values.Count);
-        if (frames == null || frames.Count < 2) return null;
+        if (frames == null) return new(null, hasTargetRows ? FrameBatchStatus.InvalidIntervals : FrameBatchStatus.MissingPid);
+        if (frames.Count < 2) return new(null, FrameBatchStatus.InsufficientSamples);
         frames.Sort();
         int middle = frames.Count / 2;
         double median = frames.Count % 2 == 0 ? (frames[middle - 1] + frames[middle]) / 2 : frames[middle];
-        return new(1000 / frames.Average(), median, frames.Count);
+        double rate = 1000 / frames.Average();
+        return double.IsFinite(rate) ? new(new FrameRate(rate, median, frames.Count), FrameBatchStatus.Measured)
+            : new(null, FrameBatchStatus.InvalidIntervals);
     }
 
     static string[] Split(string row)
