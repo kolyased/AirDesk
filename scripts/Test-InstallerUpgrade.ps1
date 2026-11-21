@@ -13,7 +13,6 @@ $evidence = (New-Item -ItemType Directory -Path $EvidenceDirectory -Force).FullN
 $fixture = Join-Path $evidence ('AirDesk-upgrade-' + [guid]::NewGuid().ToString('N'))
 $destination = Join-Path $fixture 'app'
 $executable = Join-Path $destination 'AirDesk.exe'
-$uninstall = Join-Path $destination 'unins000.exe'
 $uninstallKey = 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Uninstall/{A05B3464-9731-44CA-94A7-902E82617A47}_is1'
 $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'AirDesk/AirDesk.lnk'
 $runKey = 'Software\Microsoft\Windows\CurrentVersion\Run'
@@ -43,14 +42,27 @@ function Invoke-Setup([string]$Program, [string]$Options, [string]$Phase, [switc
     finally { $process.Dispose() }
 }
 
-function Test-InstalledVersion($Package) {
+function Get-RegisteredUninstaller([string]$Phase) {
+    $registration = Get-ItemProperty -LiteralPath $uninstallKey
+    $prefix = [regex]::Escape($destination + [IO.Path]::DirectorySeparatorChar)
+    $pattern = '^"' + $prefix + '(?<name>unins[0-9]+\.exe)"$'
+    if ($registration.UninstallString -notmatch $pattern) {
+        throw "${Phase}: expected a registered Inno uninstaller inside $destination."
+    }
+    $path = Join-Path $destination $Matches.name
+    if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "${Phase}: missing registered uninstaller $path." }
+    return $path
+}
+
+function Test-InstalledVersion($Package, [string]$Phase) {
     $setup = $Package.VersionInfo
     $installed = (Get-Item -LiteralPath $executable).VersionInfo
     if ($installed.FileMajorPart -ne $setup.FileMajorPart -or $installed.FileMinorPart -ne $setup.FileMinorPart -or
-        $installed.FileBuildPart -ne $setup.FileBuildPart -or !(Test-Path -LiteralPath $shortcut -PathType Leaf) -or
-        !(Test-Path -LiteralPath $uninstallKey) -or !(Test-Path -LiteralPath $uninstall -PathType Leaf)) {
-        throw 'Installed files, version or shortcut do not match the package.'
+        $installed.FileBuildPart -ne $setup.FileBuildPart) {
+        throw "${Phase}: installed version $($installed.FileVersionRaw) does not match setup version $($setup.FileVersionRaw)."
     }
+    if (!(Test-Path -LiteralPath $shortcut -PathType Leaf)) { throw "${Phase}: missing Start-menu shortcut $shortcut." }
+    Get-RegisteredUninstaller $Phase
 }
 
 function Get-StartupCommand {
@@ -66,9 +78,18 @@ function Test-Startup($Expected = $null) {
     if ($actual -isnot [string] -or $actual -ne $Expected) { throw 'Unexpected current-user AirDesk startup command.' }
 }
 
-function Test-Uninstalled {
-    foreach ($path in $executable, (Join-Path $destination 'AirDesk.dll'), $shortcut, $uninstallKey) {
-        if (Test-Path -LiteralPath $path) { throw "Uninstaller left an installed item: $path" }
+function Test-Uninstalled([string]$Uninstaller, [string]$Phase) {
+    # Inno's temporary second phase can outlive the original uninstaller process.
+    $dataFile = [IO.Path]::ChangeExtension($Uninstaller, '.dat')
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ((Test-Path -LiteralPath $Uninstaller) -or (Test-Path -LiteralPath $dataFile)) {
+        if ($timer.Elapsed.TotalSeconds -ge 15) { throw "${Phase}: uninstaller files were not removed." }
+        Start-Sleep -Milliseconds 100
+    }
+    $paths = $executable, (Join-Path $destination 'AirDesk.dll'), (Join-Path $destination 'AirDesk.Core.dll'),
+        (Join-Path $destination 'AirDesk.Windows.dll'), $shortcut, $uninstallKey
+    foreach ($path in $paths) {
+        if (Test-Path -LiteralPath $path) { throw "${Phase}: uninstaller left an installed item: $path" }
     }
     Test-Startup
 }
@@ -95,7 +116,7 @@ New-Item -ItemType Directory -Path $fixture, $data -Force | Out-Null
 try {
     $options = '/LANG=english /DIR="{0}"' -f $destination
     Invoke-Setup $current.FullName $options 'install-current-clean'
-    Test-InstalledVersion $current
+    $uninstall = Test-InstalledVersion $current 'install-current-clean'
     Test-Startup
     if ($DesktopSmoke) {
         try { & (Join-Path $PSScriptRoot 'Test-Desktop.ps1') -Executable $executable -ExpectNoPawnIO }
@@ -107,10 +128,10 @@ try {
         }
     }
     Invoke-Setup $uninstall '' 'uninstall-current-clean'
-    Test-Uninstalled
+    Test-Uninstalled $uninstall 'uninstall-current-clean'
 
     Invoke-Setup $previous.FullName $options 'install-previous'
-    Test-InstalledVersion $previous
+    $null = Test-InstalledVersion $previous 'install-previous'
     Test-Startup
     $preferencesFixture = '{"SchemaVersion":2,"Theme":1,"Aliases":{"/cpu":"QA processor"}}'
     $historyFixture = '{"Version":1,"Points":[]}'
@@ -129,23 +150,23 @@ try {
         if ($created) { $mutex.ReleaseMutex() }
         $mutex.Dispose()
     }
-    Test-InstalledVersion $previous
+    $null = Test-InstalledVersion $previous 'blocked-while-running'
     Test-Startup
     Test-SavedData
 
     Invoke-Setup $current.FullName "$options /TASKS=autostart" 'install-update'
-    Test-InstalledVersion $current
+    $uninstall = Test-InstalledVersion $current 'install-update'
     Test-Startup ('"{0}" --autostart' -f $executable)
     Test-SavedData
     Invoke-Setup $uninstall '' 'uninstall-update'
-    Test-Uninstalled
+    Test-Uninstalled $uninstall 'uninstall-update'
     Test-SavedData
     Invoke-Setup $previous.FullName $options 'rollback'
-    Test-InstalledVersion $previous
+    $uninstall = Test-InstalledVersion $previous 'rollback'
     Test-Startup
     Test-SavedData
     Invoke-Setup $uninstall '' 'uninstall-rollback'
-    Test-Uninstalled
+    Test-Uninstalled $uninstall 'uninstall-rollback'
     Test-SavedData
     'PASS: clean install, running-instance protection, upgrade, startup task, uninstall, rollback and preserved settings/history.'
 }
