@@ -19,12 +19,14 @@ internal static class ReleaseUpdates
     public static string VersionLabel => typeof(ReleaseUpdates).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
         ?? Installed.ToString(3);
 
-    public static async Task<ReleasePackage?> CheckAsync(CancellationToken cancel)
+    public static Task<ReleasePackage?> CheckAsync(CancellationToken cancel) => CheckAsync(http, Installed, cancel);
+
+    internal static async Task<ReleasePackage?> CheckAsync(HttpClient client, Version installed, CancellationToken cancel)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, $"https://api.github.com/repos/{ReleasePackage.Repository}/releases/latest");
-        request.Headers.UserAgent.ParseAdd("AirDesk/" + Installed.ToString(3));
+        request.Headers.UserAgent.ParseAdd("AirDesk/" + installed.ToString(3));
         request.Headers.Accept.ParseAdd("application/vnd.github+json");
-        using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancel).ConfigureAwait(false);
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancel).ConfigureAwait(false);
         if (response.StatusCode == HttpStatusCode.NotFound) return null;
         response.EnsureSuccessStatusCode();
         using var source = await response.Content.ReadAsStreamAsync(cancel).ConfigureAwait(false);
@@ -32,20 +34,26 @@ internal static class ReleaseUpdates
         int read = await source.ReadAtLeastAsync(buffer, buffer.Length, false, cancel).ConfigureAwait(false);
         if (read == buffer.Length) throw new InvalidDataException("Ответ GitHub превышает допустимый размер.");
         using var document = JsonDocument.Parse(buffer.AsMemory(0, read));
-        return ReleasePackage.Parse(document.RootElement, Installed);
+        return ReleasePackage.Parse(document.RootElement, installed);
     }
 
     public static async Task SaveVerifiedAsync(ReleasePackage package, string destination, CancellationToken cancel)
     {
         string executable = Environment.ProcessPath ?? throw new InvalidOperationException("Не удалось определить путь к AirDesk.exe.");
-        var signer = await VerifiedSignerAsync(executable, cancel).ConfigureAwait(false);
+        await SaveVerifiedAsync(package, destination, executable, http, VerifiedSignerAsync, cancel).ConfigureAwait(false);
+    }
+
+    internal static async Task SaveVerifiedAsync(ReleasePackage package, string destination, string executable, HttpClient client,
+        Func<string, CancellationToken, Task<string?>> verifySigner, CancellationToken cancel)
+    {
+        var signer = await verifySigner(executable, cancel).ConfigureAwait(false);
         if (signer == null)
             throw new InvalidOperationException("Эта копия AirDesk не имеет действительной подписи. Приложение не может установить доверие к обновлению.");
 
         string temp = Path.Combine(Path.GetDirectoryName(destination)!, Guid.NewGuid().ToString("N") + ".exe");
         try
         {
-            using var response = await GetAssetAsync(package.Url, cancel).ConfigureAwait(false);
+            using var response = await GetAssetAsync(client, package.Url, cancel).ConfigureAwait(false);
             using var source = await response.Content.ReadAsStreamAsync(cancel).ConfigureAwait(false);
             using (var file = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536, useAsync: true))
             using (var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
@@ -62,7 +70,7 @@ internal static class ReleaseUpdates
                 }
                 if (!package.Matches(size, sha.GetHashAndReset())) throw new InvalidDataException("SHA-256 установщика не совпадает с релизом.");
             }
-            string? updateSigner = await VerifiedSignerAsync(temp, cancel).ConfigureAwait(false);
+            string? updateSigner = await verifySigner(temp, cancel).ConfigureAwait(false);
             if (!string.Equals(signer, updateSigner, StringComparison.Ordinal))
                 throw new InvalidDataException("Windows не подтвердила подпись того же издателя.");
             var info = FileVersionInfo.GetVersionInfo(temp);
@@ -73,11 +81,11 @@ internal static class ReleaseUpdates
         finally { File.Delete(temp); }
     }
 
-    static async Task<HttpResponseMessage> GetAssetAsync(Uri url, CancellationToken cancel)
+    static async Task<HttpResponseMessage> GetAssetAsync(HttpClient client, Uri url, CancellationToken cancel)
     {
         for (int hop = 0; hop < 4; hop++)
         {
-            var response = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancel).ConfigureAwait(false);
+            var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancel).ConfigureAwait(false);
             if (response.IsSuccessStatusCode) return response;
             using (response)
             {
